@@ -1,26 +1,45 @@
 """Message handling module."""
 
 import html
-import sqlite3
+import time
 
 from telebot.apihelper import ApiTelegramException, create_forum_topic
 from telebot.formatting import apply_html_entities
 from telebot.types import Message
 
 from src.config import logger, _
-from src.utils.helpers import escape_markdown
+from src.utils.db_helper import get_db_connection
+from src.utils.helpers import build_user_info_pin_text, escape_markdown, send_and_pin_user_info
+from src.utils.message_permissions import classify_message_permissions
+from src.utils.message_split import split_caption, split_html_text
+
+
+class PartialSendError(Exception):
+    """Raised when some chunks were sent before a Telegram API failure."""
+
+    def __init__(self, cause: Exception, sent: list[Message], remaining_chunks: list[str],
+                 *, needs_full_retry: bool = False):
+        self.cause = cause
+        self.sent = sent
+        self.remaining_chunks = remaining_chunks
+        self.needs_full_retry = needs_full_retry
+        super().__init__(str(cause))
 
 
 class MessageHandler:
     """Handles message forwarding between users and group."""
 
-    def __init__(self, bot, group_id: int, db_path: str, cache, captcha_manager, auto_response_manager):
+    def __init__(self, bot, group_id: int, db_path: str, cache, captcha_manager, auto_response_manager,
+                 spam_detector_manager=None, bot_instance=None, permission_manager=None):
         self.bot = bot
         self.group_id = group_id
         self.db_path = db_path
         self.cache = cache
         self.captcha_manager = captcha_manager
         self.auto_response_manager = auto_response_manager
+        self.spam_detector_manager = spam_detector_manager
+        self.bot_instance = bot_instance
+        self.permission_manager = permission_manager or getattr(bot_instance, "permission_manager", None)
 
     def check_valid_chat(self, message: Message) -> bool:
         """Check if message is in valid chat context."""
@@ -39,12 +58,14 @@ class MessageHandler:
             msg_text = None
 
         if message.caption:
-            msg_caption = apply_html_entities(message.caption, message.entities,
-                                              None) if message.entities else html.escape(message.caption)
+            caption_entities = getattr(message, "caption_entities", None)
+            msg_caption = apply_html_entities(message.caption, caption_entities,
+                                              None) if caption_entities else html.escape(message.caption)
         else:
             msg_caption = None
 
-        with sqlite3.connect(self.db_path) as db:
+        # Autocommit + WAL connection: avoid holding a write transaction across Telegram I/O.
+        with get_db_connection(self.db_path) as db:
             cursor = db.cursor()
 
             if message.chat.id != self.group_id:
@@ -54,19 +75,151 @@ class MessageHandler:
 
     def _handle_user_message(self, message: Message, msg_text: str, msg_caption: str, cursor, db):
         """Handle messages from users."""
+        start_time = time.time()
+
         logger.info(
             _("Received message from {}, content: {}, type: {}").format(
                 message.from_user.id, message.text, message.content_type))
 
         # Captcha handler
         if not self._check_captcha(message, cursor, db):
+            processing_time = (time.time() - start_time) * 1000
+            logger.info(_("Message from user {} blocked by captcha ({:.2f}ms)").format(
+                message.from_user.id, processing_time))
             return
 
-        # Check if the user is banned
-        if (result := cursor.execute("SELECT ban FROM topics WHERE user_id = ? LIMIT 1",
-                                     (message.from_user.id,)).fetchone()) and result[0] == 1:
-            logger.info(_("User {} is banned").format(message.from_user.id))
+        # Check if the user is blocked
+        is_blocked = cursor.execute("SELECT 1 FROM blocked_users WHERE user_id = ? LIMIT 1",
+                                    (message.from_user.id,)).fetchone() is not None
+
+        if is_blocked:
+            # Update user info in blocked_users table
+            cursor.execute(
+                "UPDATE blocked_users SET username = ?, first_name = ?, last_name = ? WHERE user_id = ?",
+                (message.from_user.username, message.from_user.first_name,
+                 message.from_user.last_name, message.from_user.id)
+            )
+
+            processing_time = (time.time() - start_time) * 1000
+            logger.info(_("Message from blocked user {} rejected ({:.2f}ms)").format(
+                message.from_user.id, processing_time))
+
+            # Send auto-reply if enabled
+            if self.cache.get("setting_blocked_user_reply_enabled") == "enable":
+                reply_message = self.cache.get("setting_blocked_user_reply_message")
+                if reply_message:
+                    try:
+                        self.bot.send_message(message.chat.id, reply_message)
+                        logger.info(_("Sent auto-reply to blocked user {}").format(message.from_user.id))
+                    except Exception as e:
+                        logger.error(_("Failed to send auto-reply to blocked user {}: {}").format(
+                            message.from_user.id, str(e)))
+
             return
+
+        denied_permissions = self._get_denied_permissions(message)
+        if denied_permissions and self._handle_permission_restriction(message, denied_permissions):
+            processing_time = (time.time() - start_time) * 1000
+            logger.info(_("Message from user {} blocked by permissions {} ({:.2f}ms)").format(
+                message.from_user.id, ", ".join(denied_permissions), processing_time))
+            return
+
+        # Check for spam using detector manager
+        is_spam_detected = False
+        spam_info = None
+
+        if self.spam_detector_manager:
+            is_spam_detected, spam_info = self.spam_detector_manager.detect_spam(message)
+
+            if is_spam_detected:
+                # Get spam topic ID from cache
+                spam_topic_id = self.cache.get("spam_topic_id")
+                if spam_topic_id is None:
+                    # Fallback to main topic if spam topic not configured
+                    spam_topic_id = None
+                    logger.warning(_("Spam topic not configured, using main topic"))
+
+                # Forward directly to spam topic without creating user thread
+                try:
+                    fwd_msgs = self._send_message_by_type(message, msg_text, msg_caption,
+                                                          self.group_id, spam_topic_id, None, silent=True)
+
+                    # Build alert message based on detection info
+                    alert_msg = f"🚫 {_('[Spam Detected]')}\n"
+                    alert_msg += f"{_('User ID')}: {message.from_user.id}\n"
+
+                    if spam_info:
+                        if "detector" in spam_info:
+                            alert_msg += f"{_('Detector')}: {spam_info['detector']}\n"
+                        if "method" in spam_info:
+                            alert_msg += f"{_('Method')}: {spam_info['method']}\n"
+                        if "matched" in spam_info:
+                            alert_msg += f"{_('Matched')}: {spam_info['matched']}\n"
+                        if "confidence" in spam_info:
+                            alert_msg += f"{_('Confidence')}: {spam_info['confidence']:.2%}\n"
+
+                    self.bot.send_message(
+                        self.group_id,
+                        alert_msg,
+                        message_thread_id=spam_topic_id,
+                        reply_to_message_id=fwd_msgs[0].message_id,
+                        disable_notification=True
+                    )
+                except (PartialSendError, ApiTelegramException) as e:
+                    api_error = e.cause if isinstance(e, PartialSendError) else e
+                    # If spam topic not found, try to recreate it
+                    if self._is_topic_missing_error(api_error):
+                        logger.warning(_("Spam topic not found, attempting to recreate..."))
+                        if self.bot_instance:
+                            try:
+                                self.bot_instance._create_spam_topic()
+                                spam_topic_id = self.cache.get("spam_topic_id")
+                                logger.info(_("Spam topic recreated, retrying message forward..."))
+
+                                # Retry forwarding
+                                fwd_msgs = self._send_message_by_type(message, msg_text, msg_caption,
+                                                                      self.group_id, spam_topic_id, None, silent=True)
+
+                                # Build and send alert message
+                                alert_msg = f"🚫 {_('[Spam Detected]')}\n"
+                                alert_msg += f"{_('User ID')}: {message.from_user.id}\n"
+                                if spam_info:
+                                    if "detector" in spam_info:
+                                        alert_msg += f"{_('Detector')}: {spam_info['detector']}\n"
+                                    if "method" in spam_info:
+                                        alert_msg += f"{_('Method')}: {spam_info['method']}\n"
+                                    if "matched" in spam_info:
+                                        alert_msg += f"{_('Matched')}: {spam_info['matched']}\n"
+
+                                self.bot.send_message(
+                                    self.group_id,
+                                    alert_msg,
+                                    message_thread_id=spam_topic_id,
+                                    reply_to_message_id=fwd_msgs[0].message_id,
+                                    disable_notification=True
+                                )
+                            except Exception as retry_error:
+                                logger.error(
+                                    _("Failed to recreate spam topic and forward message: {}").format(str(retry_error)))
+                                # Fallback to main topic
+                                self.bot.send_message(
+                                    self.group_id,
+                                    f"⚠️ {_('[Spam - Topic Error]')}\n{_('User ID')}: {message.from_user.id}",
+                                    message_thread_id=None,
+                                    disable_notification=True
+                                )
+                        else:
+                            logger.error(_("Cannot recreate spam topic: bot instance not available"))
+                    else:
+                        logger.error(_("Failed to forward spam message: {}").format(str(api_error)))
+
+                # Log processing time
+                processing_time = (time.time() - start_time) * 1000
+                logger.info(_("Spam message from user {} processed in {:.2f}ms (matched: {})").format(
+                    message.from_user.id, processing_time, spam_info.get('matched', 'unknown')))
+
+                # Done, return early
+                return
 
         # Auto response
         auto_response = self._handle_auto_response(message)
@@ -76,13 +229,55 @@ class MessageHandler:
         if thread_id is None:
             return
 
-        fwd_msg = self._forward_to_group(message, msg_text, msg_caption, thread_id, cursor)
+        # Forward the message (may recreate topic and return a new thread_id)
+        fwd_msg, thread_id = self._forward_to_group(message, msg_text, msg_caption, thread_id, cursor, db)
         if fwd_msg is None:
             return
 
         if auto_response is not None:
             self.bot.send_message(self.group_id, _("[Auto Response]") + auto_response,
                                   message_thread_id=thread_id)
+
+        # Log processing time
+        processing_time = (time.time() - start_time) * 1000  # Convert to milliseconds
+        logger.info(_("Message from user {} processed in {:.2f}ms").format(
+            message.from_user.id, processing_time))
+
+    def _get_denied_permissions(self, message: Message) -> list[str]:
+        """Return required permission keys denied for this user."""
+        required_permissions = classify_message_permissions(message)
+        if not required_permissions:
+            return []
+
+        if self.permission_manager is None:
+            logger.warning(_("Permission manager not configured; allowing message from user {}").format(
+                message.from_user.id))
+            return []
+
+        return [
+            permission_key
+            for permission_key in required_permissions
+            if not self.permission_manager.resolve_permission(message.from_user.id, permission_key)
+        ]
+
+    def _handle_permission_restriction(self, message: Message, denied_permissions: list[str]) -> bool:
+        """Send optional user-only restriction reply for denied permissions."""
+        if self.permission_manager is None:
+            return False
+
+        reply_message = self.permission_manager.format_restricted_reply(denied_permissions)
+        if reply_message is not None:
+            try:
+                self.bot.send_message(
+                    message.chat.id,
+                    reply_message,
+                    reply_to_message_id=message.message_id
+                )
+            except Exception as e:
+                logger.error(_("Failed to send permission restriction reply to user {}: {}").format(
+                    message.from_user.id, str(e)))
+
+        return True
 
     def _check_captcha(self, message: Message, cursor, db) -> bool:
         """Check and handle captcha verification."""
@@ -93,7 +288,8 @@ class MessageHandler:
         if (captcha := self.cache.get(f"captcha_{message.from_user.id}")) is not None:
             if not self.captcha_manager.verify_captcha(message.from_user.id, message.text):
                 logger.info(_("User {} entered an incorrect answer").format(message.from_user.id))
-                self.bot.send_message(message.chat.id, _("The answer is incorrect, please try again"))
+                self.bot.send_message(message.chat.id, _("The answer is incorrect, please try again"),
+                                      reply_to_message_id=message.message_id)
                 return False
             logger.info(_("User {} passed the captcha").format(message.from_user.id))
             self.bot.send_message(message.chat.id, _("Verification successful, you can now send messages"))
@@ -102,8 +298,32 @@ class MessageHandler:
             return False
 
         # Check if the user is verified
+        # For TGuard, check verification status when user sends a message (if there's a pending token)
+        if self.cache.get("setting_captcha") == "tguard":
+            if self.cache.get(f"tguard_token_{message.from_user.id}"):
+                # User has pending verification, check status now
+                if self.captcha_manager.check_tguard_verification_status(message.from_user.id):
+                    # Verification just completed, allow message to proceed
+                    logger.info(
+                        _("User {} completed TGuard verification (checked on message)").format(message.from_user.id))
+                    # Continue processing the message (is_user_verified will return True now)
+                else:
+                    # Still not verified
+                    logger.info(_("User {} verification still pending").format(message.from_user.id))
+                    self.bot.send_message(message.chat.id,
+                                          _("⚠️ Your message was not sent. Please complete verification first."),
+                                          reply_to_message_id=message.message_id)
+                    return False
+
+        # Check if the user is verified (for all captcha types)
         if not self.captcha_manager.is_user_verified(message.from_user.id, db):
             logger.info(_("User {} is not verified").format(message.from_user.id))
+
+            # First, reply to user's message to make it clear the message was not sent
+            self.bot.send_message(message.chat.id,
+                                  _("⚠️ Your message was not sent. Please complete verification first."),
+                                  reply_to_message_id=message.message_id)
+
             match self.cache.get("setting_captcha"):
                 case "button":
                     self.captcha_manager.generate_captcha(message.from_user.id,
@@ -114,6 +334,20 @@ class MessageHandler:
                                                                     self.cache.get("setting_captcha"))
                     self.bot.send_message(message.chat.id,
                                           _("Captcha is enabled. Please solve the following question and send the result directly\n") + captcha)
+                    return False
+                case "tguard":
+                    try:
+                        self.captcha_manager.generate_captcha(message.from_user.id,
+                                                              self.cache.get("setting_captcha"))
+                    except Exception as e:
+                        logger.error(_("TGuard verification error: {}").format(e))
+                        # Send error message to user
+                        try:
+                            self.bot.send_message(message.chat.id,
+                                                  _("Verification system error. Please try again later."))
+                        except Exception:
+                            pass
+                        # Error notification to group is already handled in CaptchaManager
                     return False
                 case _:
                     logger.error(_("Invalid captcha setting"))
@@ -141,6 +375,28 @@ class MessageHandler:
             return auto_response_result["response"]
         return None
 
+    @staticmethod
+    def _is_topic_missing_error(exc: Exception) -> bool:
+        """Return True when Telegram reports a deleted/missing forum topic."""
+        description = getattr(exc, "description", "") or ""
+        haystack = f"{exc} {description}".lower()
+        markers = (
+            "message thread not found",
+            "thread not found",
+            "topic_deleted",
+            "topic not found",
+        )
+        return any(marker in haystack for marker in markers)
+
+    def _invalidate_stale_topic(self, user_id: int, thread_id: int, cursor) -> None:
+        """Remove stale topic mapping and related message links from DB/cache."""
+        cursor.execute("DELETE FROM topics WHERE thread_id = ?", (thread_id,))
+        cursor.execute("DELETE FROM messages WHERE topic_id = ?", (thread_id,))
+        cursor.connection.commit()
+        self.cache.delete(f"threadid_{thread_id}_userid")
+        self.cache.delete(f"chat_{user_id}_threadid")
+        logger.warning(_("Stale topic {} for user {} removed").format(thread_id, user_id))
+
     def _get_or_create_thread(self, message: Message, cursor, db) -> int:
         """Get or create a thread for the user."""
         userid = message.from_user.id
@@ -161,45 +417,100 @@ class MessageHandler:
                                (userid, topic["message_thread_id"]))
                 db.commit()
                 thread_id = topic["message_thread_id"]
-                username = _("Not set") if message.from_user.username is None else f"@{message.from_user.username}"
-                last_name = "" if message.from_user.last_name is None else f" {message.from_user.last_name}"
-                pin_message = self.bot.send_message(self.group_id,
-                                                    f"User ID: [{userid}](tg://openmessage?user_id={userid})\n"
-                                                    f"Full Name: {escape_markdown(f'{message.from_user.first_name}{last_name}')}\n"
-                                                    f"Username: {escape_markdown(username)}\n",
-                                                    message_thread_id=thread_id, parse_mode='markdown')
-                self.bot.pin_chat_message(self.group_id, pin_message.message_id)
+
+                pin_text = build_user_info_pin_text(
+                    userid, message.from_user.first_name, message.from_user.last_name,
+                    message.from_user.username)
+                send_and_pin_user_info(self.bot, self.group_id, thread_id, pin_text)
             else:
                 thread_id = thread_id[0]
             self.cache.set(f"chat_{userid}_threadid", thread_id)
         return thread_id
 
-    def _forward_to_group(self, message: Message, msg_text: str, msg_caption: str,
-                          thread_id: int, cursor) -> Message:
-        """Forward a message to the group."""
-        try:
-            reply_id = self._get_reply_id(message, thread_id, cursor, in_group=False)
-            fwd_msg = self._send_message_by_type(message, msg_text, msg_caption,
-                                                 self.group_id, thread_id, reply_id)
+    def _fallback_forward_to_general(self, message: Message, error: Exception) -> None:
+        """Notify operators and dump the original message into General."""
+        logger.error(_("Failed to forward message from user {}").format(message.from_user.id))
+        logger.error(error)
+        self.bot.send_message(self.group_id,
+                              _("Failed to forward message from user {}").format(message.from_user.id),
+                              message_thread_id=None)
+        self.bot.forward_message(self.group_id, message.chat.id, message_id=message.message_id)
+
+    def _store_forward_mappings(self, cursor, received_id: int, forwarded_msgs: list[Message],
+                                topic_id: int, in_group: bool) -> None:
+        """Persist one messages-row per forwarded chunk for reply lookup."""
+        for fwd_msg in forwarded_msgs:
             cursor.execute(
                 "INSERT INTO messages (received_id, forwarded_id, topic_id, in_group) VALUES (?, ?, ?, ?)",
-                (message.message_id, fwd_msg.message_id, thread_id, False))
-            return fwd_msg
+                (received_id, fwd_msg.message_id, topic_id, in_group))
+
+    def _forward_to_group(self, message: Message, msg_text: str, msg_caption: str,
+                          thread_id: int, cursor, db) -> tuple[Message | None, int]:
+        """Forward a message to the group.
+
+        Returns (first_forwarded_message, effective_thread_id). When the stored topic is gone,
+        invalidates stale state, recreates a topic, and retries only undelivered chunks.
+        """
+        try:
+            reply_id = self._get_reply_id(message, thread_id, cursor, in_group=False)
+            fwd_msgs = self._send_message_by_type(message, msg_text, msg_caption,
+                                                  self.group_id, thread_id, reply_id)
+            self._store_forward_mappings(cursor, message.message_id, fwd_msgs, thread_id, False)
+            return fwd_msgs[0], thread_id
+        except PartialSendError as e:
+            return self._recover_stale_topic_send(
+                message, msg_text, msg_caption, thread_id, cursor, db, e.cause,
+                sent=e.sent, remaining_chunks=e.remaining_chunks,
+                needs_full_retry=e.needs_full_retry or not e.sent)
         except ApiTelegramException as e:
-            if "message thread not found" in str(e):
-                cursor.execute("DELETE FROM topics WHERE thread_id = ?", (thread_id,))
-                cursor.connection.commit()
-                self.cache.delete(f"threadid_{thread_id}_userid")
-                self.cache.delete(f"chat_{message.from_user.id}_threadid")
-                # Re-queue the message
-                return None
-            logger.error(_("Failed to forward message from user {}").format(message.from_user.id))
-            logger.error(e)
-            self.bot.send_message(self.group_id,
-                                  _("Failed to forward message from user {}").format(message.from_user.id),
-                                  message_thread_id=None)
-            self.bot.forward_message(self.group_id, message.chat.id, message_id=message.message_id)
-            return None
+            return self._recover_stale_topic_send(
+                message, msg_text, msg_caption, thread_id, cursor, db, e,
+                sent=[], remaining_chunks=[], needs_full_retry=True)
+
+    def _recover_stale_topic_send(
+            self, message: Message, msg_text: str, msg_caption: str,
+            thread_id: int, cursor, db, error: Exception, *,
+            sent: list[Message], remaining_chunks: list[str],
+            needs_full_retry: bool) -> tuple[Message | None, int]:
+        """Recreate a deleted topic and resume or fully retry the forward."""
+        if not self._is_topic_missing_error(error):
+            self._fallback_forward_to_general(message, error)
+            return None, thread_id
+
+        logger.warning(
+            _("Topic {} missing for user {}, recreating and retrying").format(
+                thread_id, message.from_user.id))
+        self._invalidate_stale_topic(message.from_user.id, thread_id, cursor)
+
+        new_thread_id = self._get_or_create_thread(message, cursor, db)
+        if new_thread_id is None:
+            self._fallback_forward_to_general(message, error)
+            return None, thread_id
+
+        try:
+            # Reply targets from the deleted topic are invalid; send without reply.
+            if needs_full_retry or not remaining_chunks:
+                fwd_msgs = self._send_message_by_type(
+                    message, msg_text, msg_caption, self.group_id, new_thread_id, None)
+            else:
+                # Already-delivered chunks lived on the deleted topic; only resume the rest.
+                if sent:
+                    logger.info(
+                        _("Resuming {} remaining chunk(s) for user {} on new topic {}").format(
+                            len(remaining_chunks), message.from_user.id, new_thread_id))
+                fwd_msgs = self._send_text_chunks(
+                    self.group_id, new_thread_id, remaining_chunks, reply_id=None, silent=False)
+            if not fwd_msgs:
+                self._fallback_forward_to_general(message, error)
+                return None, new_thread_id
+            self._store_forward_mappings(cursor, message.message_id, fwd_msgs, new_thread_id, False)
+            return fwd_msgs[0], new_thread_id
+        except PartialSendError as retry_error:
+            self._fallback_forward_to_general(message, retry_error.cause)
+            return None, new_thread_id
+        except ApiTelegramException as retry_error:
+            self._fallback_forward_to_general(message, retry_error)
+            return None, new_thread_id
 
     def _handle_group_message(self, message: Message, msg_text: str, msg_caption: str, cursor, db):
         """Handle messages from group to users."""
@@ -214,11 +525,20 @@ class MessageHandler:
             reply_id = self._get_reply_id(message, message.message_thread_id, cursor, in_group=True)
 
             try:
-                fwd_msg = self._send_message_by_type(message, msg_text, msg_caption,
-                                                     user_id, None, reply_id)
-                cursor.execute(
-                    "INSERT INTO messages (received_id, forwarded_id, topic_id, in_group) VALUES (?, ?, ?, ?)",
-                    (message.message_id, fwd_msg.message_id, message.message_thread_id, True))
+                fwd_msgs = self._send_message_by_type(message, msg_text, msg_caption,
+                                                      user_id, None, reply_id)
+                self._store_forward_mappings(
+                    cursor, message.message_id, fwd_msgs, message.message_thread_id, True)
+            except PartialSendError as e:
+                logger.error(_("Failed to forward message to user {}").format(user_id))
+                logger.error(e.cause)
+                if e.sent:
+                    self._store_forward_mappings(
+                        cursor, message.message_id, e.sent, message.message_thread_id, True)
+                self.bot.send_message(self.group_id,
+                                      _("[Alert]") + _("Failed to forward message to user {}").format(
+                                          user_id) + "\n" + str(e.cause),
+                                      message_thread_id=message.message_thread_id)
             except ApiTelegramException as e:
                 logger.error(_("Failed to forward message to user {}").format(user_id))
                 logger.error(e)
@@ -254,49 +574,132 @@ class MessageHandler:
             return int(result[0])
         return None
 
+    def _send_text_chunks(self, chat_id: int, thread_id, chunks: list[str],
+                          reply_id: int | None, silent: bool) -> list[Message]:
+        """Send pre-split text chunks; only the first keeps reply_to_message_id."""
+        sent_messages: list[Message] = []
+        for index, chunk in enumerate(chunks):
+            try:
+                sent_messages.append(
+                    self.bot.send_message(
+                        chat_id=chat_id,
+                        text=chunk,
+                        message_thread_id=thread_id,
+                        reply_to_message_id=reply_id if index == 0 else None,
+                        parse_mode='HTML',
+                        disable_notification=silent,
+                    )
+                )
+            except ApiTelegramException as e:
+                raise PartialSendError(e, sent_messages, chunks[index:]) from e
+        return sent_messages
+
+    def _send_media_with_caption(self, send_media, chat_id: int, thread_id,
+                                 msg_caption: str | None, reply_id: int | None,
+                                 silent: bool) -> list[Message]:
+        """Send media plus caption overflow follow-ups, tracking partial progress."""
+        caption, extras = split_caption(msg_caption)
+        sent: list[Message] = []
+        try:
+            sent.append(send_media(caption=caption, reply_to_message_id=reply_id))
+        except ApiTelegramException as e:
+            # Media itself failed: caller must fully retry (cannot resume with text-only).
+            raise PartialSendError(e, sent, extras, needs_full_retry=True) from e
+
+        for index, chunk in enumerate(extras):
+            try:
+                sent.append(
+                    self.bot.send_message(
+                        chat_id=chat_id,
+                        text=chunk,
+                        message_thread_id=thread_id,
+                        parse_mode='HTML',
+                        disable_notification=silent,
+                    )
+                )
+            except ApiTelegramException as e:
+                # Media already left the bot; topic recovery must resend the whole media.
+                raise PartialSendError(
+                    e, sent, extras[index:], needs_full_retry=True) from e
+        return sent
+
     def _send_message_by_type(self, message: Message, msg_text: str, msg_caption: str,
-                              chat_id: int, thread_id: int = None, reply_id: int = None) -> Message:
-        """Send a message based on its type."""
+                              chat_id: int, thread_id: int = None, reply_id: int = None,
+                              silent: bool = False) -> list[Message]:
+        """Send a message based on its type.
+
+        Text messages longer than Telegram's limit are split into multiple sends.
+        Oversized captions are truncated onto the media with follow-up text chunks.
+        Only the first chunk keeps reply_to_message_id.
+
+        Raises PartialSendError when some chunks succeed before an API failure so
+        callers can resume the remaining chunks after topic recovery.
+        """
         match message.content_type:
             case "photo":
-                return self.bot.send_photo(chat_id=chat_id, photo=message.photo[-1].file_id,
-                                           caption=msg_caption, message_thread_id=thread_id,
-                                           reply_to_message_id=reply_id, parse_mode='HTML')
+                return self._send_media_with_caption(
+                    lambda caption, reply_to_message_id: self.bot.send_photo(
+                        chat_id=chat_id, photo=message.photo[-1].file_id,
+                        caption=caption, message_thread_id=thread_id,
+                        reply_to_message_id=reply_to_message_id, parse_mode='HTML',
+                        disable_notification=silent),
+                    chat_id, thread_id, msg_caption, reply_id, silent)
             case "text":
-                return self.bot.send_message(chat_id=chat_id, text=msg_text,
-                                             message_thread_id=thread_id,
-                                             reply_to_message_id=reply_id, parse_mode='HTML')
+                return self._send_text_chunks(
+                    chat_id, thread_id, split_html_text(msg_text), reply_id, silent)
             case "sticker":
-                return self.bot.send_sticker(chat_id=chat_id, sticker=message.sticker.file_id,
-                                             message_thread_id=thread_id,
-                                             reply_to_message_id=reply_id)
+                return [self.bot.send_sticker(chat_id=chat_id, sticker=message.sticker.file_id,
+                                              message_thread_id=thread_id,
+                                              reply_to_message_id=reply_id,
+                                              disable_notification=silent)]
             case "video":
-                return self.bot.send_video(chat_id=chat_id, video=message.video.file_id,
-                                           caption=msg_caption, message_thread_id=thread_id,
-                                           reply_to_message_id=reply_id, parse_mode='HTML')
+                return self._send_media_with_caption(
+                    lambda caption, reply_to_message_id: self.bot.send_video(
+                        chat_id=chat_id, video=message.video.file_id,
+                        caption=caption, message_thread_id=thread_id,
+                        reply_to_message_id=reply_to_message_id, parse_mode='HTML',
+                        disable_notification=silent),
+                    chat_id, thread_id, msg_caption, reply_id, silent)
             case "document":
-                return self.bot.send_document(chat_id=chat_id, document=message.document.file_id,
-                                              caption=msg_caption, message_thread_id=thread_id,
-                                              reply_to_message_id=reply_id, parse_mode='HTML')
+                return self._send_media_with_caption(
+                    lambda caption, reply_to_message_id: self.bot.send_document(
+                        chat_id=chat_id, document=message.document.file_id,
+                        caption=caption, message_thread_id=thread_id,
+                        reply_to_message_id=reply_to_message_id, parse_mode='HTML',
+                        disable_notification=silent),
+                    chat_id, thread_id, msg_caption, reply_id, silent)
             case "audio":
-                return self.bot.send_audio(chat_id=chat_id, audio=message.audio.file_id,
-                                           caption=msg_caption, message_thread_id=thread_id,
-                                           reply_to_message_id=reply_id, parse_mode='HTML')
+                return self._send_media_with_caption(
+                    lambda caption, reply_to_message_id: self.bot.send_audio(
+                        chat_id=chat_id, audio=message.audio.file_id,
+                        caption=caption, message_thread_id=thread_id,
+                        reply_to_message_id=reply_to_message_id, parse_mode='HTML',
+                        disable_notification=silent),
+                    chat_id, thread_id, msg_caption, reply_id, silent)
             case "voice":
-                return self.bot.send_voice(chat_id=chat_id, voice=message.voice.file_id,
-                                           caption=msg_caption, message_thread_id=thread_id,
-                                           reply_to_message_id=reply_id, parse_mode='HTML')
+                return self._send_media_with_caption(
+                    lambda caption, reply_to_message_id: self.bot.send_voice(
+                        chat_id=chat_id, voice=message.voice.file_id,
+                        caption=caption, message_thread_id=thread_id,
+                        reply_to_message_id=reply_to_message_id, parse_mode='HTML',
+                        disable_notification=silent),
+                    chat_id, thread_id, msg_caption, reply_id, silent)
             case "animation":
-                return self.bot.send_animation(chat_id=chat_id, animation=message.animation.file_id,
-                                               caption=msg_caption, message_thread_id=thread_id,
-                                               reply_to_message_id=reply_id, parse_mode='HTML')
+                return self._send_media_with_caption(
+                    lambda caption, reply_to_message_id: self.bot.send_animation(
+                        chat_id=chat_id, animation=message.animation.file_id,
+                        caption=caption, message_thread_id=thread_id,
+                        reply_to_message_id=reply_to_message_id, parse_mode='HTML',
+                        disable_notification=silent),
+                    chat_id, thread_id, msg_caption, reply_id, silent)
             case "contact":
-                return self.bot.send_contact(chat_id=chat_id,
-                                             phone_number=message.contact.phone_number,
-                                             first_name=message.contact.first_name,
-                                             last_name=message.contact.last_name,
-                                             message_thread_id=thread_id,
-                                             reply_to_message_id=reply_id)
+                return [self.bot.send_contact(chat_id=chat_id,
+                                              phone_number=message.contact.phone_number,
+                                              first_name=message.contact.first_name,
+                                              last_name=message.contact.last_name,
+                                              message_thread_id=thread_id,
+                                              reply_to_message_id=reply_id,
+                                              disable_notification=silent)]
             case _:
                 logger.error(_("Unsupported message type") + message.content_type)
                 raise ValueError(_("Unsupported message type") + message.content_type)

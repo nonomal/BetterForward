@@ -68,7 +68,6 @@ class Database:
                         db_cursor = db.cursor()
                         db_cursor.execute("UPDATE settings SET value = ? WHERE key = 'db_version'",
                                           (str(version),))
-                        db.execute("COMMIT")
                     finally:
                         db.close()
             except Exception:
@@ -88,12 +87,16 @@ class Database:
             db.close()
 
     def set_setting(self, key: str, value: str):
-        """Set a setting value in the database."""
+        """Set a setting value in the database (insert or update)."""
         db = self.get_connection()
         try:
             db_cursor = db.cursor()
             db_cursor.execute("UPDATE settings SET value = ? WHERE key = ?", (value, key))
-            db.execute("COMMIT")
+            if db_cursor.rowcount == 0:
+                db_cursor.execute(
+                    "INSERT INTO settings (key, value) VALUES (?, ?)",
+                    (key, value),
+                )
         finally:
             db.close()
 

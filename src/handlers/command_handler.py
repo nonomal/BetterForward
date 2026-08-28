@@ -5,30 +5,78 @@ import sqlite3
 from datetime import datetime
 
 from telebot import types
-from telebot.apihelper import ApiTelegramException, delete_forum_topic, close_forum_topic, reopen_forum_topic
+from telebot.apihelper import (
+    ApiTelegramException,
+    close_forum_topic,
+    delete_forum_topic,
+    edit_forum_topic,
+    reopen_forum_topic,
+)
 from telebot.types import Message
 
 from src.config import logger, _
+from src.utils.helpers import build_user_info_pin_text, send_and_pin_user_info
+from src.utils.permissions import (
+    ALLOW,
+    DENY,
+    ENABLE,
+    join_permission_labels,
+    list_permission_command_keys,
+    list_permission_keys,
+    parse_permission_keys,
+    permission_label,
+    permission_menu_label,
+)
 
 
 class CommandHandler:
     """Handles bot commands."""
 
-    def __init__(self, bot, group_id: int, db_path: str, cache, time_zone, captcha_manager):
+    def __init__(self, bot, group_id: int, db_path: str, cache, time_zone, captcha_manager, spam_detector=None,
+                 permission_manager=None):
         self.bot = bot
         self.group_id = group_id
         self.db_path = db_path
         self.cache = cache
-        self.time_zone = time_zone
+        self._time_zone = time_zone  # Keep as fallback
         self.captcha_manager = captcha_manager
+        self.spam_detector = spam_detector
+        self.permission_manager = permission_manager
+
+    @property
+    def time_zone(self):
+        """Get current timezone from cache (allows real-time updates)."""
+        import pytz
+        tz_str = self.cache.get("setting_time_zone")
+        if tz_str:
+            try:
+                return pytz.timezone(tz_str)
+            except Exception:
+                return self._time_zone
+        return self._time_zone
 
     def check_valid_chat(self, message: Message) -> bool:
         """Check if message is in valid chat context."""
         return message.chat.id == self.group_id and message.message_thread_id is None
 
+    def _is_group_admin(self, user_id: int, chat_id: int | None = None) -> bool:
+        """Return True when the user is an administrator of the forwarding group."""
+        chat_id = chat_id or self.group_id
+        try:
+            return self.bot.get_chat_member(chat_id, user_id).status in ("administrator", "creator")
+        except ApiTelegramException:
+            return False
+
+    def _reply_command_error(self, message: Message, err: str | None):
+        """Reply with an error message when err is set; stay silent otherwise."""
+        if err:
+            self.bot.reply_to(message, err)
+
     def help_command(self, message: Message, menu_callback):
         """Handle /help and /start commands."""
         if self.check_valid_chat(message):
+            if not self._is_group_admin(message.from_user.id):
+                return
             menu_callback(message)
         else:
             default_message = self._get_setting('default_message')
@@ -43,31 +91,52 @@ class CommandHandler:
 
     def ban_user(self, message: Message):
         """Ban a user from sending messages."""
-        if message.chat.id == self.group_id and message.message_thread_id is None:
-            self.bot.send_message(self.group_id, _("This command is not available in the main chat."))
+        if message.chat.id != self.group_id or not self._is_group_admin(message.from_user.id):
             return
-        if message.chat.id != self.group_id:
-            self.bot.send_message(message.chat.id, _("This command is only available to admin users."))
+        if message.message_thread_id is None:
+            self.bot.send_message(self.group_id, _("This command is not available in the main chat."))
             return
 
         with sqlite3.connect(self.db_path) as db:
             db_cursor = db.cursor()
-            db_cursor.execute("UPDATE topics SET ban = 1 WHERE thread_id = ?", (message.message_thread_id,))
-            # Remove user from verified list
+            # Get user_id from thread
             db_cursor.execute("SELECT user_id FROM topics WHERE thread_id = ? LIMIT 1",
                               (message.message_thread_id,))
             if (user_id := db_cursor.fetchone()) is not None:
-                db_cursor.execute("DELETE FROM verified_users WHERE user_id = ?", (user_id[0],))
-            db.commit()
+                user_id = user_id[0]
+                # Add to blocked_users table with user info
+                username = message.from_user.username if hasattr(message, 'from_user') else None
+                # Get user info from the message that triggered ban (we need to get it from the thread)
+                # Since we don't have direct access, we'll get it from the first message in thread
+                db_cursor.execute(
+                    "INSERT OR REPLACE INTO blocked_users (user_id, username, first_name, last_name) VALUES (?, ?, ?, ?)",
+                    (user_id, None, None, None)  # Will be updated when user sends next message
+                )
+                # Remove user from verified list (DB + cache)
+                self.captcha_manager.remove_user_verification(user_id, db)
+                db.commit()
+            else:
+                self.bot.send_message(self.group_id, _("User not found"),
+                                      message_thread_id=message.message_thread_id)
+                return
 
-        self.bot.send_message(self.group_id, _("User banned"), message_thread_id=message.message_thread_id)
+        # Send message with delete thread button
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(
+            "🗑️ " + _("Delete This Thread"),
+            callback_data=json.dumps({"action": "delete_banned_thread", "thread_id": message.message_thread_id})
+        ))
+
+        self.bot.send_message(self.group_id, _("User banned"),
+                              message_thread_id=message.message_thread_id,
+                              reply_markup=markup)
         close_forum_topic(chat_id=self.group_id, message_thread_id=message.message_thread_id,
                           token=self.bot.token)
 
-    def unban_user(self, message: Message, user_id: int = None):
+    def unban_user(self, message: Message, user_id: int = None, operator_id: int = None):
         """Unban a user."""
-        if message.chat.id != self.group_id:
-            self.bot.send_message(message.chat.id, _("This command is only available to admin users."))
+        actor_id = operator_id if operator_id is not None else message.from_user.id
+        if message.chat.id != self.group_id or not self._is_group_admin(actor_id):
             return
 
         if user_id is None:
@@ -77,14 +146,29 @@ class CommandHandler:
                                                "Correct usage:```\n"
                                                "/unban <user ID>```", parse_mode="Markdown")
                     return
-                user_id = int(msg_split[1])
+                try:
+                    user_id = int(msg_split[1])
+                except ValueError:
+                    self.bot.reply_to(message, "Invalid command\n"
+                                               "Correct usage:```\n"
+                                               "/unban <user ID>```", parse_mode="Markdown")
+                    return
 
         if user_id is None:
             with sqlite3.connect(self.db_path) as db:
                 db_cursor = db.cursor()
-                db_cursor.execute("UPDATE topics SET ban = 0 WHERE thread_id = ?",
+                # Get user_id from thread
+                db_cursor.execute("SELECT user_id FROM topics WHERE thread_id = ? LIMIT 1",
                                   (message.message_thread_id,))
-                db.commit()
+                if (result := db_cursor.fetchone()) is not None:
+                    user_id = result[0]
+                    # Remove from blocked_users table
+                    db_cursor.execute("DELETE FROM blocked_users WHERE user_id = ?", (user_id,))
+                    db.commit()
+                else:
+                    self.bot.send_message(self.group_id, _("User not found"),
+                                          message_thread_id=message.message_thread_id)
+                    return
             self.bot.send_message(self.group_id, _("User unbanned"),
                                   message_thread_id=message.message_thread_id)
             try:
@@ -95,18 +179,26 @@ class CommandHandler:
         else:
             with sqlite3.connect(self.db_path) as db:
                 db_cursor = db.cursor()
-                db_cursor.execute("SELECT thread_id FROM topics WHERE user_id = ? LIMIT 1", (user_id,))
-                thread_id = db_cursor.fetchone()
-                if thread_id is None:
+                # Check if user exists in blocked_users table
+                db_cursor.execute("SELECT 1 FROM blocked_users WHERE user_id = ? LIMIT 1", (user_id,))
+                if db_cursor.fetchone() is None:
                     self.bot.send_message(self.group_id, _("User not found"))
                     return
-                db_cursor.execute("UPDATE topics SET ban = 0 WHERE user_id = ?", (user_id,))
+
+                # Remove from blocked_users table
+                db_cursor.execute("DELETE FROM blocked_users WHERE user_id = ?", (user_id,))
                 db.commit()
-            try:
-                reopen_forum_topic(chat_id=self.group_id, message_thread_id=thread_id[0],
-                                   token=self.bot.token)
-            except ApiTelegramException:
-                pass
+
+                # Try to reopen thread if it exists
+                db_cursor.execute("SELECT thread_id FROM topics WHERE user_id = ? LIMIT 1", (user_id,))
+                thread_result = db_cursor.fetchone()
+                if thread_result is not None:
+                    try:
+                        reopen_forum_topic(chat_id=self.group_id, message_thread_id=thread_result[0],
+                                           token=self.bot.token)
+                    except ApiTelegramException:
+                        pass
+
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
                                                   callback_data=json.dumps({"action": "menu"})))
@@ -118,39 +210,48 @@ class CommandHandler:
 
     def terminate_thread(self, thread_id=None, user_id=None):
         """Terminate and delete a thread."""
+        original_thread_id = thread_id
+        db_user_id = None
+        db_thread_id = None
+
         with sqlite3.connect(self.db_path) as db:
             db_cursor = db.cursor()
             if thread_id is not None:
                 result = db_cursor.execute("SELECT user_id FROM topics WHERE thread_id = ? LIMIT 1",
                                            (thread_id,))
-                if (user_id := result.fetchone()) is not None:
-                    user_id = user_id[0]
+                if (fetched_user_id := result.fetchone()) is not None:
+                    db_user_id = fetched_user_id[0]
+                    db_thread_id = thread_id
                     db_cursor.execute("DELETE FROM topics WHERE thread_id = ?", (thread_id,))
                     db.commit()
             elif user_id is not None:
                 result = db_cursor.execute("SELECT thread_id FROM topics WHERE user_id = ? LIMIT 1",
                                            (user_id,))
-                if (thread_id := result.fetchone()) is not None:
-                    thread_id = thread_id[0]
+                if (fetched_thread_id := result.fetchone()) is not None:
+                    db_thread_id = fetched_thread_id[0]
+                    db_user_id = user_id
                     db_cursor.execute("DELETE FROM topics WHERE user_id = ?", (user_id,))
                     db.commit()
 
-            if user_id and thread_id:
-                self.cache.delete(f"chat_{user_id}_threadid")
-                self.cache.delete(f"threadid_{thread_id}_userid")
-                try:
-                    delete_forum_topic(chat_id=self.group_id, message_thread_id=thread_id,
-                                       token=self.bot.token)
-                except ApiTelegramException:
-                    pass
-                db_cursor.execute("DELETE FROM messages WHERE topic_id = ?", (thread_id,))
+            if db_user_id and db_thread_id:
+                self.cache.delete(f"chat_{db_user_id}_threadid")
+                self.cache.delete(f"threadid_{db_thread_id}_userid")
+                db_cursor.execute("DELETE FROM messages WHERE topic_id = ?", (db_thread_id,))
                 db.commit()
-        logger.info(_("Terminating thread") + str(thread_id))
+
+        final_thread_id = original_thread_id if original_thread_id is not None else db_thread_id
+        if final_thread_id is not None:
+            try:
+                delete_forum_topic(chat_id=self.group_id, message_thread_id=final_thread_id,
+                                   token=self.bot.token)
+            except ApiTelegramException:
+                pass
+
+        logger.info(_("Terminating thread") + str(final_thread_id))
 
     def handle_terminate(self, message: Message):
         """Handle /terminate command."""
-        if (message.chat.id == self.group_id) and (
-                self.bot.get_chat_member(message.chat.id, message.from_user.id).status in ["administrator", "creator"]):
+        if message.chat.id == self.group_id and self._is_group_admin(message.from_user.id):
             user_id = None
             thread_id = None
             if message.message_thread_id is None:
@@ -180,11 +281,9 @@ class CommandHandler:
             markup.add(confirm_button, cancel_button)
             self.bot.reply_to(message, _("Are you sure you want to terminate this thread?"),
                               reply_markup=markup)
-        else:
-            self.bot.send_message(message.chat.id, _("This command is only available to admin users."))
 
     def delete_message(self, message: Message):
-        """Delete a forwarded message."""
+        """Delete a forwarded message (all split chunks when present)."""
         if self.check_valid_chat(message):
             return
         if message.reply_to_message is None:
@@ -192,26 +291,32 @@ class CommandHandler:
             return
 
         msg_id = message.reply_to_message.message_id
+        in_group = message.chat.id == self.group_id
         with sqlite3.connect(self.db_path) as db:
             db_cursor = db.cursor()
             db_cursor.execute(
-                "SELECT topic_id, forwarded_id FROM messages WHERE received_id = ? AND in_group = ? LIMIT 1",
-                (msg_id, message.chat.id == self.group_id))
-            if (result := db_cursor.fetchone()) is None:
+                "SELECT topic_id, forwarded_id FROM messages WHERE received_id = ? AND in_group = ?",
+                (msg_id, in_group))
+            rows = db_cursor.fetchall()
+            if not rows:
                 return
-            topic_id, forwarded_id = result
-            if message.chat.id == self.group_id:
+            topic_id = rows[0][0]
+            forwarded_ids = [row[1] for row in rows]
+            if in_group:
                 db_cursor.execute("SELECT user_id FROM topics WHERE thread_id = ? LIMIT 1", (topic_id,))
                 if (user_id := db_cursor.fetchone()) is None or user_id[0] is None:
                     return
-                self.bot.delete_message(chat_id=user_id[0], message_id=forwarded_id)
+                for forwarded_id in forwarded_ids:
+                    try:
+                        self.bot.delete_message(chat_id=user_id[0], message_id=forwarded_id)
+                    except ApiTelegramException:
+                        pass
             else:
                 self.bot.send_message(chat_id=self.group_id,
                                       text=_("[Alert]") + _("Message deleted by user"),
-                                      reply_to_message_id=forwarded_id)
-            # Delete the message from the database
+                                      reply_to_message_id=forwarded_ids[0])
             db_cursor.execute("DELETE FROM messages WHERE received_id = ? AND in_group = ?",
-                              (msg_id, message.chat.id == self.group_id))
+                              (msg_id, in_group))
             db.commit()
 
         # Delete the current message
@@ -220,7 +325,9 @@ class CommandHandler:
 
     def handle_verify(self, message: Message):
         """Handle /verify command to manually set verification status."""
-        if message.chat.id != self.group_id or message.message_thread_id is None:
+        ok, err = self._admin_topic_command_access_ok(message)
+        if not ok:
+            self._reply_command_error(message, err)
             return
 
         command_parts = message.text.split()
@@ -249,6 +356,307 @@ class CommandHandler:
                 self.captcha_manager.remove_user_verification(user_id, db)
                 self.bot.send_message(message.chat.id, _("User verification removed."),
                                       message_thread_id=message.message_thread_id)
+
+    _GETNOTE_MAX_LEN = 3500
+
+    def _parse_setnote_body(self, text: str | None) -> str | None:
+        """Return text to store, or None to clear note (NULL)."""
+        if not text:
+            return None
+        bot_username = (self.bot.get_me().username or "").lower()
+        parts = text.split("\n", 1)
+        line0 = parts[0]
+        cont = parts[1] if len(parts) > 1 else None
+        l0 = line0.lower()
+        prefixes = ["/setnote"]
+        if bot_username:
+            prefixes.append(f"/setnote@{bot_username}")
+        prefixes.sort(key=len, reverse=True)
+        n = 0
+        for p in prefixes:
+            if l0.startswith(p.lower()):
+                n = len(p)
+                break
+        if n == 0:
+            return None
+        first_rest = line0[n:].lstrip()
+        if cont is not None:
+            body = (first_rest + "\n" + cont) if first_rest else cont
+        else:
+            body = first_rest
+        if not body.strip():
+            return None
+        return body
+
+    def _topic_note_reply(self, message: Message, text: str):
+        self.bot.reply_to(message, text)
+
+    def _topic_note_place_ok(self, message: Message) -> tuple[bool, str | None]:
+        """Valid group + user topic (not General); any member may pass this for /getnote."""
+        if message.chat.id != self.group_id:
+            return False, _("This command can only be used in the forwarding group.")
+        tid = message.message_thread_id
+        if tid is None:
+            return False, _("Use this command inside a user topic.")
+        if tid == 1:
+            return False, _("Cannot use this command in the main thread")
+        return True, None
+
+    def _admin_topic_command_access_ok(self, message: Message) -> tuple[bool, str | None]:
+        """Admin-only topic commands: silent for non-admins and private/wrong chat."""
+        if message.chat.id != self.group_id:
+            return False, None
+        if not self._is_group_admin(message.from_user.id):
+            return False, None
+        tid = message.message_thread_id
+        if tid is None:
+            return False, _("Use this command inside a user topic.")
+        if tid == 1:
+            return False, _("Cannot use this command in the main thread")
+        return True, None
+
+    def _topic_note_set_access_ok(self, message: Message) -> tuple[bool, str | None]:
+        """Place + administrator for /setnote."""
+        return self._admin_topic_command_access_ok(message)
+
+    def _topic_admin_access_ok(self, message: Message) -> tuple[bool, str | None]:
+        """Place + administrator for topic admin commands."""
+        return self._admin_topic_command_access_ok(message)
+
+    def handle_refresh(self, message: Message):
+        """Refresh pinned user info in the current topic."""
+        ok, err = self._topic_admin_access_ok(message)
+        if not ok:
+            self._reply_command_error(message, err)
+            return
+
+        thread_id = message.message_thread_id
+        with sqlite3.connect(self.db_path) as db:
+            db_cursor = db.cursor()
+            db_cursor.execute("SELECT user_id FROM topics WHERE thread_id = ? LIMIT 1", (thread_id,))
+            row = db_cursor.fetchone()
+        if row is None:
+            self.bot.reply_to(message, _("User not found"))
+            return
+        user_id = row[0]
+
+        try:
+            chat = self.bot.get_chat(user_id)
+        except ApiTelegramException as e:
+            self.bot.reply_to(message, _("Failed to fetch user info: {}").format(str(e)))
+            return
+
+        try:
+            edit_forum_topic(chat_id=self.group_id, message_thread_id=thread_id,
+                             name=f"{chat.first_name} | {user_id}", token=self.bot.token)
+        except ApiTelegramException as e:
+            logger.warning(f"Failed to update topic name for user {user_id}: {e}")
+
+        pin_text = build_user_info_pin_text(user_id, chat.first_name, chat.last_name, chat.username)
+        send_and_pin_user_info(self.bot, self.group_id, thread_id, pin_text)
+        self.bot.reply_to(message, _("User info refreshed."))
+
+    def handle_setnote(self, message: Message):
+        """Set or clear topic note (multiline body); empty body clears."""
+        ok, err = self._topic_note_set_access_ok(message)
+        if not ok:
+            self._reply_command_error(message, err)
+            return
+        tid = message.message_thread_id
+        body = self._parse_setnote_body(message.text)
+        with sqlite3.connect(self.db_path) as db:
+            db_cursor = db.cursor()
+            db_cursor.execute("SELECT 1 FROM topics WHERE thread_id = ? LIMIT 1", (tid,))
+            if db_cursor.fetchone() is None:
+                self.bot.reply_to(message, _("User not found"))
+                return
+            db_cursor.execute("UPDATE topics SET note = ? WHERE thread_id = ?", (body, tid))
+            db.commit()
+        if body is None:
+            self.bot.reply_to(message, _("Note cleared."))
+        else:
+            self.bot.reply_to(message, _("Note saved."))
+
+    def handle_getnote(self, message: Message):
+        """Show topic note."""
+        ok, err = self._topic_note_place_ok(message)
+        if not ok:
+            self._topic_note_reply(message, err)
+            return
+        tid = message.message_thread_id
+        with sqlite3.connect(self.db_path) as db:
+            db_cursor = db.cursor()
+            db_cursor.execute("SELECT note FROM topics WHERE thread_id = ? LIMIT 1", (tid,))
+            row = db_cursor.fetchone()
+        if row is None:
+            self.bot.reply_to(message, _("User not found"))
+            return
+        note = row[0]
+        if note is None or not str(note).strip():
+            self.bot.reply_to(message, _("No note set for this topic."))
+            return
+        note = str(note)
+        if len(note) > self._GETNOTE_MAX_LEN:
+            note = note[: self._GETNOTE_MAX_LEN] + "\n" + _("(truncated)")
+        self.bot.reply_to(message, note)
+
+    def allow_permissions(self, message: Message):
+        """Grant explicit permission overrides for the current topic's user."""
+        self._handle_permission_override_command(message, ALLOW)
+
+    def disallow_permissions(self, message: Message):
+        """Deny explicit permission overrides for the current topic's user."""
+        self._handle_permission_override_command(message, DENY)
+
+    def show_user_permissions(self, message: Message):
+        """Show effective permission status for the current topic's user."""
+        if self.permission_manager is None:
+            self.bot.reply_to(message, _("Permission settings are not available"))
+            return
+
+        ok, err = self._permission_command_access_ok(message)
+        if not ok:
+            self._reply_command_error(message, err)
+            return
+
+        user_id = self._user_id_for_topic(message.message_thread_id)
+        if user_id is None:
+            self.bot.reply_to(message, _("User not found"))
+            return
+
+        lines = [_("Permissions for user {}:").format(user_id), ""]
+        overrides = self.permission_manager.get_user_overrides(user_id)
+
+        for permission_key in list_permission_keys():
+            global_default = self.permission_manager.get_global_default_value(permission_key)
+            global_text = _("Enabled") if global_default == ENABLE else _("Disabled")
+            override = overrides.get(permission_key)
+            if override == ALLOW:
+                override_text = _("Allowed")
+            elif override == DENY:
+                override_text = _("Disallowed")
+            else:
+                override_text = _("Inherit")
+
+            effective = _("Allowed") if self.permission_manager.resolve_permission(
+                user_id, permission_key) else _("Denied")
+
+            lines.append(
+                _("{}: global {}, override {}, effective {}").format(
+                    permission_menu_label(permission_key),
+                    global_text,
+                    override_text,
+                    effective,
+                )
+            )
+
+        self.bot.reply_to(message, "\n".join(lines))
+
+    def reset_user_permissions(self, message: Message):
+        """Clear per-user permission overrides for the current topic's user."""
+        if self.permission_manager is None:
+            self.bot.reply_to(message, _("Permission settings are not available"))
+            return
+
+        ok, err = self._permission_command_access_ok(message)
+        if not ok:
+            self._reply_command_error(message, err)
+            return
+
+        user_id = self._user_id_for_topic(message.message_thread_id)
+        if user_id is None:
+            self.bot.reply_to(message, _("User not found"))
+            return
+
+        valid_keys, unknown_values = parse_permission_keys(self._permission_command_args(message.text))
+        if not valid_keys and not unknown_values:
+            self.bot.reply_to(message, self._reset_permission_command_usage())
+            return
+
+        if unknown_values:
+            self.bot.reply_to(
+                message,
+                _("Unknown permission keys: {}").format(", ".join(unknown_values)) + "\n" +
+                self._reset_permission_command_usage()
+            )
+            return
+
+        for permission_key in valid_keys:
+            self.permission_manager.clear_user_override(user_id, permission_key)
+
+        labels = join_permission_labels(
+            [permission_label(permission_key) for permission_key in valid_keys]
+        )
+        self.bot.reply_to(
+            message,
+            _("Reset permissions for user {}: {}").format(user_id, labels)
+        )
+
+    def _handle_permission_override_command(self, message: Message, override: str):
+        if self.permission_manager is None:
+            self.bot.reply_to(message, _("Permission settings are not available"))
+            return
+
+        ok, err = self._permission_command_access_ok(message)
+        if not ok:
+            self._reply_command_error(message, err)
+            return
+
+        user_id = self._user_id_for_topic(message.message_thread_id)
+        if user_id is None:
+            self.bot.reply_to(message, _("User not found"))
+            return
+
+        valid_keys, unknown_values = parse_permission_keys(self._permission_command_args(message.text))
+        if not valid_keys and not unknown_values:
+            self.bot.reply_to(message, self._permission_command_usage())
+            return
+
+        if unknown_values:
+            self.bot.reply_to(
+                message,
+                _("Unknown permission keys: {}").format(", ".join(unknown_values)) + "\n" +
+                self._permission_command_usage()
+            )
+            return
+
+        for permission_key in valid_keys:
+            self.permission_manager.set_user_override(user_id, permission_key, override)
+
+        labels = join_permission_labels(
+            [permission_label(permission_key) for permission_key in valid_keys]
+        )
+        action_text = _("Allowed") if override == ALLOW else _("Disallowed")
+        self.bot.reply_to(
+            message,
+            _("{} permissions for user {}: {}").format(action_text, user_id, labels)
+        )
+
+    def _permission_command_access_ok(self, message: Message) -> tuple[bool, str | None]:
+        return self._admin_topic_command_access_ok(message)
+
+    def _user_id_for_topic(self, thread_id: int):
+        with sqlite3.connect(self.db_path) as db:
+            db_cursor = db.cursor()
+            db_cursor.execute("SELECT user_id FROM topics WHERE thread_id = ? LIMIT 1", (thread_id,))
+            row = db_cursor.fetchone()
+        return row[0] if row else None
+
+    def _permission_command_args(self, text: str | None) -> str:
+        if not text:
+            return ""
+        parts = text.split(maxsplit=1)
+        return parts[1] if len(parts) > 1 else ""
+
+    def _permission_command_usage(self) -> str:
+        return _("Usage: /allow photo video link or /disallow photo video link "
+                 "(multiple keys allowed). Use all to grant/deny all permissions.") + "\n" + \
+            _("Valid permission keys: {}").format(", ".join(list_permission_command_keys()))
+
+    def _reset_permission_command_usage(self) -> str:
+        return _("Usage: /resetpermissions photo video link (multiple keys allowed). "
+                 "Use all to reset all permission overrides.") + "\n" + \
+            _("Valid permission keys: {}").format(", ".join(list_permission_command_keys()))
 
     def handle_edit(self, message: Message):
         """Handle edited messages."""

@@ -3,6 +3,7 @@
 import json
 import re
 import sqlite3
+import httpx
 from datetime import datetime
 
 import pytz
@@ -11,25 +12,65 @@ from telebot.apihelper import ApiTelegramException
 from telebot.types import Message
 
 from src.config import logger, _
+from src.utils.auto_response import looks_like_regex
+from src.version import VERSION
+from src.utils.permissions import (
+    DEFAULT_RESTRICTED_REPLY_MESSAGE,
+    DISABLE,
+    ENABLE,
+    get_default_restricted_reply_message,
+    list_permission_keys,
+    permission_label,
+    permission_menu_label,
+)
 
 
 class AdminHandler:
     """Handles administrative functions like settings, menus, and broadcasts."""
 
-    def __init__(self, bot, group_id: int, db_path: str, cache, database, auto_response_manager):
+    def __init__(self, bot, group_id: int, db_path: str, cache, database, auto_response_manager,
+                 spam_keyword_manager=None, bot_instance=None, permission_manager=None):
         self.bot = bot
         self.group_id = group_id
         self.db_path = db_path
         self.cache = cache
         self.database = database
         self.auto_response_manager = auto_response_manager
+        self.spam_keyword_manager = spam_keyword_manager
+        self.bot_instance = bot_instance
+        self.permission_manager = permission_manager or getattr(bot_instance, "permission_manager", None)
         # Get timezone from cache
         tz_str = self.cache.get("setting_time_zone")
         self.time_zone = pytz.timezone(tz_str) if tz_str else pytz.UTC
 
+    OPERATOR_CACHE_KEY = "admin_operator_id"
+
     def check_valid_chat(self, message: Message) -> bool:
         """Check if message is in valid chat context."""
         return message.chat.id == self.group_id and message.message_thread_id is None
+
+    def set_operator(self, user_id: int):
+        """Remember which admin started the current multi-step admin flow."""
+        self.cache.set(self.OPERATOR_CACHE_KEY, int(user_id), 600)
+
+    def _is_group_admin(self, user_id: int) -> bool:
+        try:
+            return self.bot.get_chat_member(self.group_id, user_id).status in ("administrator", "creator")
+        except Exception:
+            return False
+
+    def _accept_admin_step(self, message: Message, next_handler) -> bool:
+        """Accept next-step input only from the active admin operator."""
+        if not self.check_valid_chat(message):
+            return False
+        operator_id = self.cache.get(self.OPERATOR_CACHE_KEY)
+        if operator_id is not None and message.from_user.id != operator_id:
+            self.bot.register_next_step_handler(message, next_handler)
+            return False
+        if not self._is_group_admin(message.from_user.id):
+            self.bot.register_next_step_handler(message, next_handler)
+            return False
+        return True
 
     def update_time_zone(self):
         """Update the timezone from cache and propagate to auto_response_manager."""
@@ -44,6 +85,11 @@ class AdminHandler:
         """Display the main admin menu."""
         if not self.check_valid_chat(message):
             return
+        # When opened from /help, require admin; callback path already authenticated.
+        if not edit and not self._is_group_admin(message.from_user.id):
+            return
+        if not edit:
+            self.set_operator(message.from_user.id)
 
         markup = types.InlineKeyboardMarkup()
         buttons = [
@@ -53,12 +99,24 @@ class AdminHandler:
                                        callback_data=json.dumps({"action": "default_msg"})),
             types.InlineKeyboardButton("⛔" + _("Banned Users"),
                                        callback_data=json.dumps({"action": "ban_user"})),
+            types.InlineKeyboardButton("🚫" + _("Spam Keywords"),
+                                       callback_data=json.dumps({"action": "spam_keywords"})),
+            types.InlineKeyboardButton("🚷" + _("Blocked User Reply"),
+                                       callback_data=json.dumps({"action": "blocked_reply_settings"})),
+            types.InlineKeyboardButton("🔐" + _("Permission Settings"),
+                                       callback_data=json.dumps({"action": "permission_settings"})),
             types.InlineKeyboardButton("🔒" + _("Captcha Settings"),
                                        callback_data=json.dumps({"action": "captcha_settings"})),
+            types.InlineKeyboardButton("🛡️" + _("TGuard API Settings"),
+                                       callback_data=json.dumps({"action": "tguard_api_settings"})),
             types.InlineKeyboardButton("🌍" + _("Time Zone Settings"),
                                        callback_data=json.dumps({"action": "time_zone_settings"})),
             types.InlineKeyboardButton("📢" + _("Broadcast Message"),
-                                       callback_data=json.dumps({"action": "broadcast_message"}))
+                                       callback_data=json.dumps({"action": "broadcast_message"})),
+            types.InlineKeyboardButton("📡" + _("Show Host IP Info"),
+                                       callback_data=json.dumps({"action": "show_host_ip"})),
+            types.InlineKeyboardButton("🏷️" + _("Show Version"),
+                                       callback_data=json.dumps({"action": "show_version"}))
         ]
 
         for i in range(0, len(buttons), 2):
@@ -70,6 +128,198 @@ class AdminHandler:
         else:
             self.bot.send_message(self.group_id, _("Menu"), reply_markup=markup,
                                   message_thread_id=None)
+
+    # Permission Management
+    def permission_settings_menu(self, message: Message, edit: bool = False):
+        """Display permission settings submenu."""
+        if not self.check_valid_chat(message):
+            return
+
+        if self.permission_manager is None:
+            self._send_or_edit_permission_menu_message(
+                message, _("Permission settings are not available"), None, edit)
+            return
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(
+            "⚙️ " + _("Default Permission Settings"),
+            callback_data=json.dumps({"action": "default_permissions"})
+        ))
+        markup.add(types.InlineKeyboardButton(
+            "✏️ " + _("Permission Restriction Reply Message"),
+            callback_data=json.dumps({"action": "permission_reply_settings"})
+        ))
+        markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                              callback_data=json.dumps({"action": "menu"})))
+
+        text = _("Permission Settings") + "\n\n" + _("Configure global permission policy and restriction replies.")
+        self._send_or_edit_permission_menu_message(message, text, markup, edit)
+
+    def default_permissions_menu(self, message: Message, edit: bool = False):
+        """Display global default permission settings."""
+        if not self.check_valid_chat(message):
+            return
+
+        if self.permission_manager is None:
+            self._send_or_edit_permission_menu_message(
+                message, _("Permission settings are not available"), None, edit)
+            return
+
+        markup = types.InlineKeyboardMarkup()
+        text = _("Default Permission Settings") + "\n\n"
+        text += _("Current global default permissions:") + "\n"
+
+        for permission_key in list_permission_keys():
+            current_value = self.permission_manager.get_global_default_value(permission_key)
+            is_enabled = current_value == ENABLE
+            status_text = _("Enabled") if is_enabled else _("Disabled")
+            text += f"{permission_menu_label(permission_key)}: {status_text}\n"
+            button_prefix = "✅ " if is_enabled else "❌ "
+            markup.add(types.InlineKeyboardButton(
+                f"{button_prefix}{permission_menu_label(permission_key)}: {status_text}",
+                callback_data=json.dumps({
+                    "action": "toggle_permission_default",
+                    "key": permission_key,
+                })
+            ))
+
+        markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                              callback_data=json.dumps({"action": "permission_settings"})))
+
+        self._send_or_edit_permission_menu_message(message, text, markup, edit)
+
+    def toggle_permission_default(self, message: Message, permission_key: str):
+        """Toggle one global default permission setting."""
+        if not self.check_valid_chat(message):
+            return
+
+        if self.permission_manager is None:
+            self._send_or_edit_permission_menu_message(
+                message, _("Permission settings are not available"), None, True)
+            return
+
+        current_value = self.permission_manager.get_global_default_value(permission_key)
+        next_value = DISABLE if current_value == ENABLE else ENABLE
+        self.permission_manager.set_global_default(permission_key, next_value)
+        self.default_permissions_menu(message, edit=True)
+
+    def permission_reply_settings_menu(self, message: Message, edit: bool = False):
+        """Display permission restriction reply settings."""
+        if not self.check_valid_chat(message):
+            return
+
+        if self.permission_manager is None:
+            self._send_or_edit_permission_menu_message(
+                message, _("Permission settings are not available"), None, edit)
+            return
+
+        current_enabled = self.permission_manager.get_restricted_reply_enabled_value()
+        current_message = self.permission_manager.get_restricted_reply_message()
+
+        markup = types.InlineKeyboardMarkup()
+        if current_enabled == ENABLE:
+            markup.add(types.InlineKeyboardButton(
+                "🔕 " + _("Disable Reply"),
+                callback_data=json.dumps({"action": "set_permission_reply_enabled", "value": DISABLE})
+            ))
+        else:
+            markup.add(types.InlineKeyboardButton(
+                "🔔 " + _("Enable Reply"),
+                callback_data=json.dumps({"action": "set_permission_reply_enabled", "value": ENABLE})
+            ))
+
+        markup.add(types.InlineKeyboardButton(
+            "✏️ " + _("Edit Reply Message"),
+            callback_data=json.dumps({"action": "edit_permission_reply_message"})
+        ))
+        markup.add(types.InlineKeyboardButton(
+            "🔄 " + _("Reset Reply Message"),
+            callback_data=json.dumps({"action": "reset_permission_reply_message"})
+        ))
+        markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                              callback_data=json.dumps({"action": "permission_settings"})))
+
+        status_text = _("Enabled") if current_enabled == ENABLE else _("Disabled")
+        example_label = permission_label("photo")
+        text = _("Permission Restriction Reply Message") + "\n\n"
+        text += _("Status: {}").format(status_text) + "\n"
+        text += _("Current message: {}").format(current_message) + "\n\n"
+        text += _("{permission} is used to render the permission variable, for example \"{}\".").replace(
+            "{}", example_label)
+
+        self._send_or_edit_permission_menu_message(message, text, markup, edit)
+
+    def set_permission_reply_enabled(self, message: Message, value: str):
+        """Toggle permission restriction replies."""
+        if value not in (ENABLE, DISABLE):
+            self.bot.send_message(self.group_id, _("Invalid action"))
+            return
+        if self.permission_manager is None:
+            self._send_or_edit_permission_menu_message(
+                message, _("Permission settings are not available"), None, True)
+            return
+
+        self.permission_manager.set_restricted_reply_enabled(value)
+        self.permission_reply_settings_menu(message, edit=True)
+
+    def edit_permission_reply_message(self, message: Message):
+        """Start editing permission restriction reply message."""
+        example_label = permission_label("photo")
+        msg = self.bot.edit_message_text(
+            text=_("Please send the message to reply when a permission blocks a user message.\n"
+                   "Send /cancel to cancel this operation.\n\n"
+                   "{permission} is used to render the permission variable, for example \"{}\".").replace(
+                "{}", example_label),
+            chat_id=self.group_id,
+            message_id=message.message_id)
+        self.bot.register_next_step_handler(msg, self.process_permission_reply_message)
+
+    def process_permission_reply_message(self, message: Message):
+        """Process permission restriction reply message editing."""
+        if not self._accept_admin_step(message, self.process_permission_reply_message):
+            return
+        if not self.check_valid_chat(message):
+            logger.warning(
+                f"Permission reply edit from wrong context: chat_id={message.chat.id}, thread_id={message.message_thread_id}")
+            return
+
+        if isinstance(message.text, str) and message.text.startswith("/cancel"):
+            self.bot.send_message(self.group_id, _("Operation cancelled"))
+            return
+
+        if message.content_type != "text":
+            self.bot.send_message(self.group_id, _("Invalid input"))
+            return
+
+        reply_message = message.text.strip()
+        self.permission_manager.set_restricted_reply_message(reply_message)
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                              callback_data=json.dumps({"action": "permission_reply_settings"})))
+        self.bot.send_message(self.group_id,
+                              _("Permission restriction reply message updated: {}").format(reply_message),
+                              reply_markup=markup)
+
+    def reset_permission_reply_message(self, message: Message):
+        """Reset permission restriction reply message to the default template."""
+        if self.permission_manager is None:
+            self._send_or_edit_permission_menu_message(
+                message, _("Permission settings are not available"), None, True)
+            return
+
+        self.permission_manager.set_restricted_reply_message(DEFAULT_RESTRICTED_REPLY_MESSAGE)
+        self.permission_reply_settings_menu(message, edit=True)
+
+    def _send_or_edit_permission_menu_message(self, message: Message, text: str, markup, edit: bool):
+        if edit:
+            self.bot.edit_message_text(text, message.chat.id, message.message_id,
+                                       reply_markup=markup)
+        else:
+            self.bot.send_message(text=text,
+                                  chat_id=message.chat.id,
+                                  message_thread_id=None,
+                                  reply_markup=markup)
 
     # Auto Reply Management
     def auto_reply_menu(self, message: Message):
@@ -98,7 +348,7 @@ class AdminHandler:
 
     def add_auto_response_type(self, message: Message):
         """Process the trigger pattern for auto response."""
-        if not self.check_valid_chat(message):
+        if not self._accept_admin_step(message, self.add_auto_response_type):
             return
         if isinstance(message.text, str) and message.text.startswith("/cancel"):
             self.bot.send_message(self.group_id, _("Operation cancelled"))
@@ -108,12 +358,8 @@ class AdminHandler:
             return
 
         self.cache.set("auto_response_key", message.text, 300)
-        try:
-            re.compile(message.text)
-            is_regex = True
-        except re.error:
-            is_regex = False
-        self.cache.set("auto_response_regex", is_regex, 300)
+        # Plain keywords stay exact matches; only metacharacter patterns become regex.
+        self.cache.set("auto_response_regex", looks_like_regex(message.text), 300)
         self.add_auto_response_value(message)
 
     def add_auto_response_value(self, message: Message):
@@ -146,7 +392,7 @@ class AdminHandler:
 
     def add_auto_response_time(self, message: Message):
         """Get time restrictions for auto response."""
-        if not self.check_valid_chat(message):
+        if not self._accept_admin_step(message, self.add_auto_response_time):
             return
         if isinstance(message.text, str) and message.text.startswith("/cancel"):
             self.bot.send_message(self.group_id, _("Operation cancelled"))
@@ -204,7 +450,7 @@ class AdminHandler:
 
     def set_auto_response_start_time(self, message: Message):
         """Set the start time for auto response."""
-        if not self.check_valid_chat(message):
+        if not self._accept_admin_step(message, self.set_auto_response_start_time):
             return
         try:
             start_time = datetime.strptime(message.text, "%H:%M").time()
@@ -220,7 +466,7 @@ class AdminHandler:
 
     def set_auto_response_end_time(self, message: Message):
         """Set the end time for auto response."""
-        if not self.check_valid_chat(message):
+        if not self._accept_admin_step(message, self.set_auto_response_end_time):
             return
         try:
             end_time = datetime.strptime(message.text, "%H:%M").time()
@@ -350,22 +596,72 @@ class AdminHandler:
                                    message_id=message.message_id, reply_markup=markup)
 
     # Ban User Management
-    def manage_ban_user(self, message: Message):
-        """Display list of banned users."""
+    def manage_ban_user(self, message: Message, page: int = 1, page_size: int = 10):
+        """Display list of banned users with pagination."""
         with sqlite3.connect(self.db_path) as db:
             db_cursor = db.cursor()
+
+            # Get total count
+            db_cursor.execute("SELECT COUNT(*) FROM blocked_users")
+            total = db_cursor.fetchone()[0]
+            total_pages = (total + page_size - 1) // page_size if total > 0 else 1
+            page = max(1, min(page, total_pages))
+
+            # Query from blocked_users table with pagination
+            offset = (page - 1) * page_size
+            db_cursor.execute("""
+                              SELECT user_id, username, first_name, last_name, blocked_at
+                              FROM blocked_users
+                              ORDER BY blocked_at DESC LIMIT ?
+                              OFFSET ?
+                              """, (page_size, offset))
+            banned_users = db_cursor.fetchall()
+
             markup = types.InlineKeyboardMarkup()
             back_button = types.InlineKeyboardButton("⬅️" + _("Back"),
                                                      callback_data=json.dumps({"action": "menu"}))
-            db_cursor.execute("SELECT user_id FROM topics WHERE ban = 1")
-            banned_users = db_cursor.fetchall()
+
             text = _("Banned User List:") + "\n"
-            for user in banned_users:
-                text += "-" * 20 + "\n"
-                text += f"User ID: {user[0]}\n"
-                markup.add(types.InlineKeyboardButton(
-                    text=str(user[0]),
-                    callback_data=json.dumps({"action": "select_ban_user", "id": user[0]})))
+            text += _("Total: {}").format(total) + "\n"
+            text += _("Page: {}").format(page) + "/" + str(total_pages) + "\n\n"
+
+            if not banned_users:
+                text += _("No banned users") + "\n"
+            else:
+                for user in banned_users:
+                    user_id, username, first_name, last_name, blocked_at = user
+                    text += "-" * 20 + "\n"
+                    text += f"User ID: {user_id}\n"
+
+                    # Display name info if available
+                    if first_name or last_name:
+                        full_name = f"{first_name or ''} {last_name or ''}".strip()
+                        text += f"{_('Name')}: {full_name}\n"
+                    if username:
+                        text += f"{_('Username')}: @{username}\n"
+
+                    text += f"{_('Blocked at')}: {blocked_at}\n"
+
+                    markup.add(types.InlineKeyboardButton(
+                        text=f"ID: {user_id}",
+                        callback_data=json.dumps({"action": "select_ban_user", "id": user_id})))
+
+            # Add pagination buttons
+            if 1 < page < total_pages:
+                markup.row(
+                    types.InlineKeyboardButton("⬅️" + _("Previous Page"),
+                                               callback_data=json.dumps({"action": "ban_user", "page": page - 1})),
+                    types.InlineKeyboardButton("➡️" + _("Next Page"),
+                                               callback_data=json.dumps({"action": "ban_user", "page": page + 1})))
+            elif page > 1:
+                markup.add(types.InlineKeyboardButton("⬅️" + _("Previous Page"),
+                                                      callback_data=json.dumps(
+                                                          {"action": "ban_user", "page": page - 1})))
+            elif page < total_pages:
+                markup.add(types.InlineKeyboardButton("➡️" + _("Next Page"),
+                                                      callback_data=json.dumps(
+                                                          {"action": "ban_user", "page": page + 1})))
+
             markup.add(back_button)
             self.bot.send_message(text=text,
                                   chat_id=message.chat.id,
@@ -376,11 +672,22 @@ class AdminHandler:
         """Display options for a banned user."""
         with sqlite3.connect(self.db_path) as db:
             db_cursor = db.cursor()
-            db_cursor.execute("SELECT thread_id FROM topics WHERE user_id = ? LIMIT 1", (user_id,))
-            thread_id = db_cursor.fetchone()
-            if thread_id is None:
-                self.bot.send_message(self.group_id, _("User not found"))
+            # Get user info from blocked_users
+            db_cursor.execute(
+                "SELECT username, first_name, last_name, blocked_at FROM blocked_users WHERE user_id = ? LIMIT 1",
+                (user_id,)
+            )
+            user_info = db_cursor.fetchone()
+
+            if user_info is None:
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                                      callback_data=json.dumps({"action": "ban_user"})))
+                self.bot.edit_message_text(_("User not found"), message.chat.id, message.message_id,
+                                           reply_markup=markup)
                 return
+
+            username, first_name, last_name, blocked_at = user_info
 
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("❌" + _("Unban"),
@@ -388,7 +695,18 @@ class AdminHandler:
                                                                         "id": user_id})))
         markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
                                               callback_data=json.dumps({"action": "ban_user"})))
-        self.bot.edit_message_text(f"User ID: {user_id}", message.chat.id, message.message_id,
+
+        # Build user info text
+        text = _("Blocked User Details") + "\n\n"
+        text += f"User ID: {user_id}\n"
+        if first_name or last_name:
+            full_name = f"{first_name or ''} {last_name or ''}".strip()
+            text += f"{_('Name')}: {full_name}\n"
+        if username:
+            text += f"{_('Username')}: @{username}\n"
+        text += f"{_('Blocked at')}: {blocked_at}\n"
+
+        self.bot.edit_message_text(text, message.chat.id, message.message_id,
                                    reply_markup=markup)
 
     # Default Message Settings
@@ -420,6 +738,8 @@ class AdminHandler:
 
     def edit_default_msg_handle(self, message: Message):
         """Handle default message editing."""
+        if not self._accept_admin_step(message, self.edit_default_msg_handle):
+            return
         if not isinstance(message.text, str):
             self.bot.send_message(self.group_id, _("Invalid input"))
             return
@@ -450,6 +770,7 @@ class AdminHandler:
             _("Disable Captcha"): "disable",
             _("Math Captcha"): "math",
             _("Button Captcha"): "button",
+            _("TGuard Captcha"): "tguard",
         }
         if not self.check_valid_chat(message):
             return
@@ -469,6 +790,20 @@ class AdminHandler:
 
     def set_captcha(self, message: Message, value: str):
         """Set captcha setting."""
+        # Check if TGuard is selected and if API settings are configured
+        if value == "tguard":
+            api_url = self.database.get_setting('tguard_api_url')
+            api_key = self.database.get_setting('tguard_api_key')
+            if not api_url or not api_key:
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                                      callback_data=json.dumps({"action": "captcha_settings"})))
+                self.bot.edit_message_text(
+                    _("TGuard Captcha requires API URL and API Key to be configured.\n"
+                      "Please configure them in TGuard API Settings first."),
+                    message.chat.id, message.message_id, reply_markup=markup)
+                return
+        
         self.database.set_setting('captcha', value)
         self.cache.set("setting_captcha", value)
         markup = types.InlineKeyboardMarkup()
@@ -476,6 +811,109 @@ class AdminHandler:
                                               callback_data=json.dumps({"action": "menu"})))
         self.bot.edit_message_text(_("Captcha settings updated"),
                                    message.chat.id, message.message_id, reply_markup=markup)
+
+    # TGuard API Settings
+    def tguard_api_settings_menu(self, message: Message):
+        """Display TGuard API settings menu."""
+        if not self.check_valid_chat(message):
+            return
+        
+        current_url = self.database.get_setting('tguard_api_url') or _("Not set")
+        current_key = self.database.get_setting('tguard_api_key') or _("Not set")
+        
+        # Mask API key for display
+        if current_key != _("Not set") and len(current_key) > 8:
+            masked_key = current_key[:4] + "*" * (len(current_key) - 8) + current_key[-4:]
+        else:
+            masked_key = current_key
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔗" + _("Set API URL"),
+                                              callback_data=json.dumps({"action": "set_tguard_api_url"})))
+        markup.add(types.InlineKeyboardButton("🔑" + _("Set API Key"),
+                                              callback_data=json.dumps({"action": "set_tguard_api_key"})))
+        markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                              callback_data=json.dumps({"action": "menu"})))
+        
+        text = _("TGuard API Settings") + "\n\n"
+        text += _("API URL: {}").format(current_url) + "\n"
+        text += _("API Key: {}").format(masked_key) + "\n"
+        
+        self.bot.send_message(text=text,
+                              chat_id=message.chat.id,
+                              message_thread_id=None,
+                              reply_markup=markup)
+
+    def set_tguard_api_url(self, message: Message):
+        """Start setting TGuard API URL."""
+        if not self.check_valid_chat(message):
+            return
+        msg = self.bot.edit_message_text(
+            text=_("Please send the TGuard API URL (e.g., https://example.com).\n"
+                   "Send /cancel to cancel this operation."),
+            chat_id=self.group_id, message_id=message.message_id)
+        self.bot.register_next_step_handler(msg, self.process_tguard_api_url)
+
+    def process_tguard_api_url(self, message: Message):
+        """Process TGuard API URL setting."""
+        if not self._accept_admin_step(message, self.process_tguard_api_url):
+            return
+        if isinstance(message.text, str) and message.text.startswith("/cancel"):
+            self.bot.send_message(self.group_id, _("Operation cancelled"))
+            return
+        if message.content_type != "text":
+            self.bot.send_message(self.group_id, _("Invalid input"))
+            return
+        
+        api_url = message.text.strip()
+        # Basic URL validation
+        if not (api_url.startswith("http://") or api_url.startswith("https://")):
+            self.bot.send_message(self.group_id, _("Invalid URL format. Please enter a valid URL starting with http:// or https://"))
+            return
+        
+        self.database.set_setting('tguard_api_url', api_url)
+        self.cache.set("setting_tguard_api_url", api_url)
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                              callback_data=json.dumps({"action": "tguard_api_settings"})))
+        self.bot.send_message(self.group_id, _("TGuard API URL updated: {}").format(api_url),
+                              reply_markup=markup)
+
+    def set_tguard_api_key(self, message: Message):
+        """Start setting TGuard API Key."""
+        if not self.check_valid_chat(message):
+            return
+        msg = self.bot.edit_message_text(
+            text=_("Please send the TGuard API Key.\n"
+                   "Send /cancel to cancel this operation."),
+            chat_id=self.group_id, message_id=message.message_id)
+        self.bot.register_next_step_handler(msg, self.process_tguard_api_key)
+
+    def process_tguard_api_key(self, message: Message):
+        """Process TGuard API Key setting."""
+        if not self._accept_admin_step(message, self.process_tguard_api_key):
+            return
+        if isinstance(message.text, str) and message.text.startswith("/cancel"):
+            self.bot.send_message(self.group_id, _("Operation cancelled"))
+            return
+        if message.content_type != "text":
+            self.bot.send_message(self.group_id, _("Invalid input"))
+            return
+        
+        api_key = message.text.strip()
+        if not api_key:
+            self.bot.send_message(self.group_id, _("API key cannot be empty"))
+            return
+        
+        self.database.set_setting('tguard_api_key', api_key)
+        self.cache.set("setting_tguard_api_key", api_key)
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                              callback_data=json.dumps({"action": "tguard_api_settings"})))
+        self.bot.send_message(self.group_id, _("TGuard API Key updated successfully."),
+                              reply_markup=markup)
 
     # Time Zone Settings
     def time_zone_settings_menu(self, message: Message):
@@ -492,6 +930,8 @@ class AdminHandler:
 
     def validate_time_zone(self, message: Message):
         """Validate and set time zone."""
+        if not self._accept_admin_step(message, self.validate_time_zone):
+            return
         time_zone = message.text
         if (not isinstance(message.text, str)) or message.text.startswith("/cancel"):
             self.bot.send_message(self.group_id, _("Operation cancelled"))
@@ -506,9 +946,15 @@ class AdminHandler:
         """Set the time zone."""
         self.database.set_setting('time_zone', value)
         self.cache.set("setting_time_zone", value)
-        # Update timezone for both admin_handler and auto_response_manager
+
+        # Update timezone for all components
         self.time_zone = pytz.timezone(value)
         self.auto_response_manager.update_time_zone(self.time_zone)
+
+        # Update bot instance timezone if available
+        if self.bot_instance:
+            self.bot_instance.update_self_time_zone()
+
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
                                               callback_data=json.dumps({"action": "menu"})))
@@ -525,8 +971,64 @@ class AdminHandler:
             chat_id=self.group_id, message_thread_id=None)
         self.bot.register_next_step_handler(msg, self.handle_broadcast_message)
 
+    def show_host_ip(self, message: Message):
+        """Show host IP information."""
+        if not self.check_valid_chat(message):
+            return
+        try:
+            headers = {
+                "User-Agent": "curl/8.4.0",
+                "Accept": "*/*"
+            }
+            with httpx.Client(http2=True, headers=headers, verify=True) as client:
+                res = client.get("https://1.1.1.1/cdn-cgi/trace", timeout=5)
+            res.raise_for_status()
+            data = {}
+            for line in res.text.splitlines():
+                if "=" in line:
+                    key, value = line.split("=", 1)  # 只分割第一个=
+                    data[key] = value
+            ip = data.get('ip', _('Unknown'))
+            country = data.get('loc', _('Unknown'))
+            city = data.get('colo', _('Unknown'))
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Failed to retrieve IP information: {e}")
+            self.bot.send_message(self.group_id, _("Failed to retrieve IP information"))
+            return
+        except httpx.RequestError as e:
+            logger.error(f"Failed to retrieve IP information: {e}")
+            self.bot.send_message(self.group_id, _("Failed to retrieve IP information"))
+            return
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                                callback_data=json.dumps({"action": "menu"})))
+        self.bot.send_message(text=_("Host IP Information") + "\n\n" +
+                                _("Version: {}").format(VERSION) + "\n" +
+                                _("IP Address: {}").format(ip) + "\n" +
+                                _("Country: {}").format(country) + "\n" +
+                                _("City: {}").format(city),
+                                chat_id=message.chat.id,
+                                message_thread_id=None,
+                                reply_markup=markup)
+
+    def show_version(self, message: Message):
+        """Show the embedded application version."""
+        if not self.check_valid_chat(message):
+            return
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                              callback_data=json.dumps({"action": "menu"})))
+        self.bot.send_message(
+            text=_("Version Information") + "\n\n" + _("Version: {}").format(VERSION),
+            chat_id=message.chat.id,
+            message_thread_id=None,
+            reply_markup=markup,
+        )
+
     def handle_broadcast_message(self, message: Message):
         """Handle broadcast message content."""
+        if not self._accept_admin_step(message, self.handle_broadcast_message):
+            return
         if (isinstance(message.text, str) and message.text.startswith("/cancel")) or \
                 not self.check_valid_chat(message):
             self.bot.send_message(self.group_id, _("Operation cancelled"))
@@ -609,3 +1111,401 @@ class AdminHandler:
         """Cancel broadcast operation."""
         self.cache.delete("broadcast_content")
         self.cache.delete("broadcast_content_type")
+
+    # Spam Keywords Management
+    def spam_keywords_menu(self, message: Message):
+        """Display spam keywords management menu."""
+        if not self.spam_keyword_manager:
+            self.bot.send_message(self.group_id, _("Spam keywords management is not available"))
+            return
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("➕" + _("Add Keyword"),
+                                              callback_data=json.dumps({"action": "add_spam_keyword"})))
+        markup.add(types.InlineKeyboardButton("📋" + _("View Keywords"),
+                                              callback_data=json.dumps({"action": "view_spam_keywords"})))
+        markup.add(types.InlineKeyboardButton("🔄" + _("Reset Spam Topic"),
+                                              callback_data=json.dumps({"action": "reset_spam_topic"})))
+        markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                              callback_data=json.dumps({"action": "menu"})))
+
+        keyword_count = self.spam_keyword_manager.get_keyword_count()
+        spam_topic_id = self.cache.get("spam_topic_id")
+
+        text = _("Spam Keywords Management") + "\n\n"
+        text += _("Total keywords: {}").format(keyword_count) + "\n"
+        text += _("Spam Topic ID: {}").format(spam_topic_id if spam_topic_id else _("Not set")) + "\n\n"
+        text += _("Messages containing these keywords will be forwarded to the spam topic silently.")
+
+        self.bot.send_message(text=text,
+                              chat_id=message.chat.id,
+                              message_thread_id=None,
+                              reply_markup=markup)
+
+    def add_spam_keyword(self, message: Message):
+        """Start the process of adding a spam keyword."""
+        if not self.check_valid_chat(message):
+            return
+
+        msg = self.bot.edit_message_text(
+            text=_("Please send the keyword you want to add to the spam filter.\n"
+                   "Send /cancel to cancel this operation."),
+            chat_id=self.group_id,
+            message_id=message.message_id)
+        self.bot.register_next_step_handler(msg, self.process_add_spam_keyword)
+
+    def process_add_spam_keyword(self, message: Message):
+        """Process adding a spam keyword."""
+        if not self._accept_admin_step(message, self.process_add_spam_keyword):
+            return
+        # Must be in the correct group and main topic
+        if not self.check_valid_chat(message):
+            logger.warning(
+                f"Keyword add attempt from wrong context: chat_id={message.chat.id}, thread_id={message.message_thread_id}")
+            return
+
+        if isinstance(message.text, str) and message.text.startswith("/cancel"):
+            self.bot.send_message(self.group_id, _("Operation cancelled"))
+            return
+
+        if message.content_type != "text":
+            self.bot.send_message(self.group_id, _("Invalid input"))
+            return
+
+        keyword = message.text.strip()
+        if not keyword:
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                                  callback_data=json.dumps({"action": "spam_keywords"})))
+            self.bot.send_message(self.group_id, _("Keyword cannot be empty"), reply_markup=markup)
+            return
+
+        try:
+            result = self.spam_keyword_manager.add_keyword(keyword)
+
+            if result:
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                                      callback_data=json.dumps({"action": "spam_keywords"})))
+                self.bot.send_message(self.group_id,
+                                      _("Keyword added: {}").format(keyword),
+                                      reply_markup=markup)
+            else:
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                                      callback_data=json.dumps({"action": "spam_keywords"})))
+                self.bot.send_message(self.group_id,
+                                      _("Keyword already exists or is invalid"),
+                                      reply_markup=markup)
+        except Exception as e:
+            logger.error(f"Error adding spam keyword: {e}")
+            from traceback import print_exc
+            print_exc()
+            self.bot.send_message(self.group_id,
+                                  _("Failed to add keyword: {}").format(str(e)))
+
+    def view_spam_keywords(self, message: Message, page: int = 1, page_size: int = 10):
+        """Display paginated list of spam keywords."""
+        if not self.spam_keyword_manager:
+            return
+
+        keywords = self.spam_keyword_manager.get_all_keywords()
+        total = len(keywords)
+        total_pages = (total + page_size - 1) // page_size if total > 0 else 1
+
+        # Ensure page is valid
+        page = max(1, min(page, total_pages))
+
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        page_keywords = keywords[start_idx:end_idx]
+
+        # Store keywords in cache for callback access
+        self.cache.set("spam_keywords_page", keywords, 300)
+
+        markup = types.InlineKeyboardMarkup()
+        back_button = types.InlineKeyboardButton("⬅️" + _("Back"),
+                                                 callback_data=json.dumps({"action": "spam_keywords"}))
+
+        text = _("Spam Keywords List:") + "\n"
+        text += _("Total: {}").format(total) + "\n"
+        text += _("Page: {}").format(page) + "/" + str(total_pages) + "\n\n"
+
+        if not page_keywords:
+            text += _("No keywords found") + "\n"
+        else:
+            keyword_buttons = []
+            for idx, keyword in enumerate(page_keywords, start=start_idx):
+                text += f"{idx + 1}. {keyword}\n"
+                # Use index instead of keyword to avoid callback_data size limit
+                keyword_buttons.append(types.InlineKeyboardButton(
+                    text=f"#{idx + 1}",
+                    callback_data=json.dumps({"action": "select_spam_keyword", "idx": idx})))
+
+            # Add keyword selection buttons (max 5 per row)
+            for i in range(0, len(keyword_buttons), 5):
+                markup.row(*keyword_buttons[i:i + 5])
+
+        # Add pagination buttons
+        if 1 < page < total_pages:
+            markup.row(
+                types.InlineKeyboardButton("⬅️" + _("Previous Page"),
+                                           callback_data=json.dumps({"action": "view_spam_keywords",
+                                                                     "page": page - 1})),
+                types.InlineKeyboardButton("➡️" + _("Next Page"),
+                                           callback_data=json.dumps({"action": "view_spam_keywords",
+                                                                     "page": page + 1})))
+        elif page > 1:
+            markup.add(types.InlineKeyboardButton("⬅️" + _("Previous Page"),
+                                                  callback_data=json.dumps({"action": "view_spam_keywords",
+                                                                            "page": page - 1})))
+        elif page < total_pages:
+            markup.add(types.InlineKeyboardButton("➡️" + _("Next Page"),
+                                                  callback_data=json.dumps({"action": "view_spam_keywords",
+                                                                            "page": page + 1})))
+
+        markup.add(back_button)
+        self.bot.edit_message_text(text, message.chat.id, message.message_id, reply_markup=markup)
+
+    def select_spam_keyword(self, message: Message, idx: int):
+        """Display options for a specific spam keyword."""
+        # Get keyword from cache
+        keywords = self.cache.get("spam_keywords_page")
+        if keywords is None or idx >= len(keywords):
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                                  callback_data=json.dumps({"action": "view_spam_keywords"})))
+            self.bot.edit_message_text(_("Keyword not found or expired"),
+                                       message.chat.id, message.message_id,
+                                       reply_markup=markup)
+            return
+
+        keyword = keywords[idx]
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("❌" + _("Delete"),
+                                              callback_data=json.dumps({"action": "delete_spam_keyword",
+                                                                        "idx": idx})))
+        markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                              callback_data=json.dumps({"action": "view_spam_keywords"})))
+
+        text = _("Keyword: {}").format(keyword) + "\n"
+        text += _("Select an action:")
+
+        self.bot.edit_message_text(text, message.chat.id, message.message_id, reply_markup=markup)
+
+    def delete_spam_keyword(self, message: Message, idx: int):
+        """Delete a spam keyword."""
+        # Get keyword from cache
+        keywords = self.cache.get("spam_keywords_page")
+        if keywords is None or idx >= len(keywords):
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                                  callback_data=json.dumps({"action": "view_spam_keywords"})))
+            self.bot.edit_message_text(_("Keyword not found or expired"),
+                                       message.chat.id, message.message_id,
+                                       reply_markup=markup)
+            return
+
+        keyword = keywords[idx]
+
+        if self.spam_keyword_manager.remove_keyword(keyword):
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                                  callback_data=json.dumps({"action": "view_spam_keywords"})))
+            self.bot.edit_message_text(_("Keyword deleted: {}").format(keyword),
+                                       chat_id=message.chat.id,
+                                       message_id=message.message_id,
+                                       reply_markup=markup)
+        else:
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                                  callback_data=json.dumps({"action": "view_spam_keywords"})))
+            self.bot.edit_message_text(_("Failed to delete keyword"),
+                                       chat_id=message.chat.id,
+                                       message_id=message.message_id,
+                                       reply_markup=markup)
+
+    # Blocked User Reply Settings
+    def blocked_reply_settings_menu(self, message: Message):
+        """Display blocked user auto-reply settings menu."""
+        if not self.check_valid_chat(message):
+            return
+
+        current_enabled = self.database.get_setting('blocked_user_reply_enabled')
+        current_message = self.database.get_setting('blocked_user_reply_message')
+
+        markup = types.InlineKeyboardMarkup()
+
+        # Enable/Disable toggle
+        if current_enabled == 'enable':
+            markup.add(types.InlineKeyboardButton(
+                "🔕 " + _("Disable Auto Reply"),
+                callback_data=json.dumps({"action": "set_blocked_reply_enabled", "value": "disable"})
+            ))
+        else:
+            markup.add(types.InlineKeyboardButton(
+                "🔔 " + _("Enable Auto Reply"),
+                callback_data=json.dumps({"action": "set_blocked_reply_enabled", "value": "enable"})
+            ))
+
+        # Edit message button
+        markup.add(types.InlineKeyboardButton(
+            "✏️ " + _("Edit Reply Message"),
+            callback_data=json.dumps({"action": "edit_blocked_reply_message"})
+        ))
+
+        # Clear message button
+        markup.add(types.InlineKeyboardButton(
+            "🗑️ " + _("Clear Reply Message"),
+            callback_data=json.dumps({"action": "clear_blocked_reply_message"})
+        ))
+
+        markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                              callback_data=json.dumps({"action": "menu"})))
+
+        text = _("Blocked User Auto Reply Settings") + "\n\n"
+        text += _("Status: {}").format(_("Enabled") if current_enabled == 'enable' else _("Disabled")) + "\n"
+        text += _("Current message: {}").format(
+            current_message if current_message else _("Not set (no reply will be sent)")
+        ) + "\n\n"
+        text += _("When enabled, blocked users will receive this message when they try to send messages.")
+
+        self.bot.send_message(text=text,
+                              chat_id=message.chat.id,
+                              message_thread_id=None,
+                              reply_markup=markup)
+
+    def set_blocked_reply_enabled(self, message: Message, value: str):
+        """Toggle blocked user auto-reply."""
+        self.database.set_setting('blocked_user_reply_enabled', value)
+        self.cache.set("setting_blocked_user_reply_enabled", value)
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                              callback_data=json.dumps({"action": "blocked_reply_settings"})))
+
+        status_text = _("Enabled") if value == "enable" else _("Disabled")
+        self.bot.edit_message_text(_("Blocked user auto-reply has been {}.").format(status_text),
+                                   message.chat.id, message.message_id,
+                                   reply_markup=markup)
+
+    def edit_blocked_reply_message(self, message: Message):
+        """Start editing blocked user reply message."""
+        msg = self.bot.edit_message_text(
+            text=_("Please send the message to reply to blocked users.\n"
+                   "Send /cancel to cancel this operation.\n\n"
+                   "Note: You can send an empty message to disable auto-reply."),
+            chat_id=self.group_id,
+            message_id=message.message_id)
+        self.bot.register_next_step_handler(msg, self.process_edit_blocked_reply_message)
+
+    def process_edit_blocked_reply_message(self, message: Message):
+        """Process blocked user reply message editing."""
+        if not self._accept_admin_step(message, self.process_edit_blocked_reply_message):
+            return
+        if not self.check_valid_chat(message):
+            logger.warning(
+                f"Blocked reply edit from wrong context: chat_id={message.chat.id}, thread_id={message.message_thread_id}")
+            return
+
+        if isinstance(message.text, str) and message.text.startswith("/cancel"):
+            self.bot.send_message(self.group_id, _("Operation cancelled"))
+            return
+
+        if message.content_type != "text":
+            self.bot.send_message(self.group_id, _("Invalid input"))
+            return
+
+        reply_message = message.text.strip()
+        # Allow empty message to disable reply
+        if not reply_message:
+            reply_message = None
+
+        self.database.set_setting('blocked_user_reply_message', reply_message)
+        self.cache.set("setting_blocked_user_reply_message", reply_message)
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                              callback_data=json.dumps({"action": "blocked_reply_settings"})))
+
+        if reply_message:
+            self.bot.send_message(self.group_id,
+                                  _("Blocked user reply message updated: {}").format(reply_message),
+                                  reply_markup=markup)
+        else:
+            self.bot.send_message(self.group_id,
+                                  _("Blocked user reply message cleared. No auto-reply will be sent."),
+                                  reply_markup=markup)
+
+    def clear_blocked_reply_message(self, message: Message):
+        """Clear blocked user reply message."""
+        self.database.set_setting('blocked_user_reply_message', None)
+        self.cache.set("setting_blocked_user_reply_message", None)
+
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                              callback_data=json.dumps({"action": "blocked_reply_settings"})))
+        self.bot.edit_message_text(_("Blocked user reply message cleared."),
+                                   message.chat.id, message.message_id,
+                                   reply_markup=markup)
+
+    # Spam Topic Management
+    def reset_spam_topic(self, message: Message):
+        """Reset spam topic."""
+        if not self.bot_instance:
+            self.bot.send_message(self.group_id, _("Bot instance not available"))
+            return
+
+        # Confirm action
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(
+            "✅" + _("Confirm Reset"),
+            callback_data=json.dumps({"action": "confirm_reset_spam_topic"})
+        ))
+        markup.add(types.InlineKeyboardButton(
+            "❌" + _("Cancel"),
+            callback_data=json.dumps({"action": "spam_keywords"})
+        ))
+
+        self.bot.edit_message_text(
+            _("Are you sure you want to reset the spam topic?\n"
+              "This will create a new spam topic. The old topic will not be deleted."),
+            message.chat.id, message.message_id,
+            reply_markup=markup)
+
+    def confirm_reset_spam_topic(self, message: Message):
+        """Confirm and execute spam topic reset."""
+        if not self.bot_instance:
+            self.bot.edit_message_text(_("Bot instance not available"),
+                                       message.chat.id, message.message_id)
+            return
+
+        self.bot.edit_message_text(_("Resetting spam topic..."),
+                                   message.chat.id, message.message_id)
+
+        try:
+            if self.bot_instance.reset_spam_topic():
+                spam_topic_id = self.cache.get("spam_topic_id")
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                                      callback_data=json.dumps({"action": "spam_keywords"})))
+                self.bot.edit_message_text(
+                    _("Spam topic reset successfully.\nNew Topic ID: {}").format(spam_topic_id),
+                    message.chat.id, message.message_id,
+                    reply_markup=markup)
+            else:
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                                      callback_data=json.dumps({"action": "spam_keywords"})))
+                self.bot.edit_message_text(_("Failed to reset spam topic"),
+                                           message.chat.id, message.message_id,
+                                           reply_markup=markup)
+        except Exception as e:
+            logger.error(f"Error resetting spam topic: {e}")
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("⬅️" + _("Back"),
+                                                  callback_data=json.dumps({"action": "spam_keywords"})))
+            self.bot.edit_message_text(_("Failed to reset spam topic: {}").format(str(e)),
+                                       message.chat.id, message.message_id,
+                                       reply_markup=markup)

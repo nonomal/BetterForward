@@ -1,2 +1,8 @@
 .DS_Store
 .vscode/
+/.idea
+/.cursor
+/.venv
+__pycache__/
+.pytest_cache/
+*.pyc
